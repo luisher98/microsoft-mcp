@@ -1,6 +1,7 @@
 import base64
 import datetime as dt
 import pathlib as pl
+import httpx
 from typing import Any
 from fastmcp import FastMCP
 from . import graph, auth
@@ -970,3 +971,172 @@ def unified_search(
             results.setdefault("other", []).append(item)
 
     return {k: v for k, v in results.items() if v}
+
+
+# ---------------------------------------------------------------------------
+# SharePoint
+#
+# These tools target SharePoint document libraries via /sites and /drives,
+# complementing the OneDrive (/me/drive) tools above. They rely on the
+# delegated permissions Sites.ReadWrite.All and Files.ReadWrite.All, which
+# must be granted (with admin consent) on the Azure App Registration used by
+# this server. Because auth.py requests the ".default" scope, those grants are
+# picked up automatically on the next sign-in -- no code change to SCOPES is
+# needed (and would in fact break the ".default" flow).
+# ---------------------------------------------------------------------------
+
+
+def _ensure_folder(account_id: str, drive_id: str, folder_path: str) -> None:
+    """Make sure every segment of folder_path exists in the drive, creating any
+    that are missing. Safe to call repeatedly (existing folders are left
+    untouched)."""
+    parent = ""
+    for segment in [s for s in folder_path.strip("/").split("/") if s]:
+        current = f"{parent}/{segment}" if parent else segment
+        try:
+            existing = graph.request(
+                "GET", f"/drives/{drive_id}/root:/{current}", account_id
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 404:
+                raise
+            existing = None
+        if not existing:
+            children_endpoint = (
+                "/drives/{drive}/root/children".format(drive=drive_id)
+                if not parent
+                else f"/drives/{drive_id}/root:/{parent}:/children"
+            )
+            graph.request(
+                "POST",
+                children_endpoint,
+                account_id,
+                json={
+                    "name": segment,
+                    "folder": {},
+                    "@microsoft.graph.conflictBehavior": "fail",
+                },
+            )
+        parent = current
+
+
+@mcp.tool
+def sharepoint_resolve_site(account_id: str, site_search: str) -> dict[str, Any]:
+    """Resolve a SharePoint site by name, by "hostname:/sites/Path", or by full URL.
+
+    Args:
+        site_search: a site name to search for (e.g. "radon"), a Graph-style
+            path ("contoso.sharepoint.com:/sites/Radon"), or the full site URL.
+
+    Returns the matched site {id, name, webUrl} when resolved by path/URL, or a
+    list of candidates {"results": [...]} when searching by name.
+    """
+    if ":/sites/" in site_search or site_search.startswith("http"):
+        s = site_search
+        if s.startswith("http"):
+            from urllib.parse import urlparse
+
+            u = urlparse(s)
+            s = f"{u.netloc}:{u.path}".rstrip("/")
+        site = graph.request("GET", f"/sites/{s}", account_id)
+        if not site:
+            raise ValueError(f"Site not found: {site_search}")
+        return {
+            "id": site["id"],
+            "name": site.get("name"),
+            "webUrl": site.get("webUrl"),
+        }
+
+    results = list(
+        graph.request_paginated(
+            "/sites", account_id, params={"search": site_search}, limit=25
+        )
+    )
+    return {
+        "results": [
+            {"id": s["id"], "name": s.get("name"), "webUrl": s.get("webUrl")}
+            for s in results
+        ]
+    }
+
+
+@mcp.tool
+def sharepoint_list_drives(account_id: str, site_id: str) -> list[dict[str, Any]]:
+    """List the document libraries (drives) of a SharePoint site.
+
+    Returns [{id, name, webUrl}] -- pick the drive whose name matches the
+    target library (often "Documents"/"Documentos") for uploads.
+    """
+    items = list(
+        graph.request_paginated(f"/sites/{site_id}/drives", account_id, limit=50)
+    )
+    return [
+        {"id": d["id"], "name": d.get("name"), "webUrl": d.get("webUrl")}
+        for d in items
+    ]
+
+
+@mcp.tool
+def sharepoint_upload_file(
+    account_id: str,
+    drive_id: str,
+    local_file_path: str,
+    target_path: str,
+) -> dict[str, Any]:
+    """Upload a local file to a folder in a SharePoint document library (drive).
+
+    Args:
+        drive_id: drive id from sharepoint_list_drives.
+        local_file_path: path to the file on disk.
+        target_path: destination path inside the drive, e.g. "it/9187497.pdf".
+            Intermediate folders are created automatically if missing.
+
+    Files larger than ~4 MB are uploaded via an upload session automatically.
+    Returns {id, name, webUrl}.
+    """
+    path = pl.Path(local_file_path).expanduser().resolve()
+    data = path.read_bytes()
+
+    folder_path = "/".join(target_path.strip("/").split("/")[:-1])
+    if folder_path:
+        _ensure_folder(account_id, drive_id, folder_path)
+
+    result = graph.upload_large_file(
+        f"/drives/{drive_id}/root:/{target_path.strip('/')}:", data, account_id
+    )
+    if not result:
+        raise ValueError(f"Failed to upload file to: {target_path}")
+    return {
+        "id": result["id"],
+        "name": result.get("name"),
+        "webUrl": result.get("webUrl"),
+    }
+
+
+@mcp.tool
+def sharepoint_create_link(
+    account_id: str,
+    drive_id: str,
+    item_id: str,
+    link_type: str = "view",
+    scope: str = "organization",
+) -> dict[str, Any]:
+    """Create a sharing link for a file in a SharePoint document library.
+
+    Args:
+        link_type: "view" or "edit".
+        scope: "organization" (anyone signed in to the tenant) or "anonymous"
+            (anyone with the link, if tenant policy allows). Use "organization"
+            unless external no-login access is required.
+
+    Returns {webUrl} of the sharing link.
+    """
+    result = graph.request(
+        "POST",
+        f"/drives/{drive_id}/items/{item_id}/createLink",
+        account_id,
+        json={"type": link_type, "scope": scope},
+    )
+    if not result:
+        raise ValueError("Failed to create sharing link")
+    return {"webUrl": result["link"]["webUrl"]}
