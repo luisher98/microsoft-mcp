@@ -6,8 +6,23 @@ from .auth import get_token
 BASE_URL = "https://graph.microsoft.com/v1.0"
 # 15 x 320 KiB = 4,915,200 bytes
 UPLOAD_CHUNK_SIZE = 15 * 320 * 1024
+# Los que se pueden repetir sin duplicar nada. HTTP no promete que PATCH lo sea,
+# pero en Graph fija las propiedades que lleva: dos veces dejan lo mismo que una.
+METODOS_IDEMPOTENTES = frozenset({"GET", "HEAD", "PUT", "PATCH", "DELETE"})
 
 _client = httpx.Client(timeout=30.0, follow_redirects=True)
+
+
+def _se_reintenta(metodo: str, estado: int) -> bool:
+    """Si `request` vuelve a pedir lo que Graph ha contestado con `estado`.
+
+    Un 429, con cualquier método: Graph lo rechazó sin procesarlo. Un 5xx, solo
+    con un método idempotente, porque Graph pudo hacer el trabajo antes de
+    fallar: un POST a /me/sendMail repetido manda el correo otra vez.
+    """
+    if estado == 429:
+        return True
+    return estado >= 500 and metodo in METODOS_IDEMPOTENTES
 
 
 def request(
@@ -43,42 +58,30 @@ def request(
 
     retry_count = 0
     while retry_count <= max_retries:
-        try:
-            response = _client.request(
-                method=method,
-                url=f"{BASE_URL}{path}",
-                headers=headers,
-                params=params,
-                json=json,
-                content=data,
-            )
+        response = _client.request(
+            method=method,
+            url=f"{BASE_URL}{path}",
+            headers=headers,
+            params=params,
+            json=json,
+            content=data,
+        )
 
+        if retry_count < max_retries and _se_reintenta(method, response.status_code):
             if response.status_code == 429:
                 retry_after = int(response.headers.get("Retry-After", "5"))
-                if retry_count < max_retries:
-                    time.sleep(min(retry_after, 60))
-                    retry_count += 1
-                    continue
-
-            if response.status_code >= 500 and retry_count < max_retries:
+                wait_time = min(retry_after, 60)
+            else:
                 wait_time = (2**retry_count) * 1
-                time.sleep(wait_time)
-                retry_count += 1
-                continue
+            time.sleep(wait_time)
+            retry_count += 1
+            continue
 
-            response.raise_for_status()
+        response.raise_for_status()
 
-            if response.content:
-                return response.json()
-            return None
-
-        except httpx.HTTPStatusError as e:
-            if retry_count < max_retries and e.response.status_code >= 500:
-                wait_time = (2**retry_count) * 1
-                time.sleep(wait_time)
-                retry_count += 1
-                continue
-            raise
+        if response.content:
+            return response.json()
+        return None
 
     return None
 
