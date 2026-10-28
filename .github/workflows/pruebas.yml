@@ -1,0 +1,48 @@
+# Las pruebas unitarias en cada push y en cada PR (README, «Pruebas»).
+#
+# `uv run pytest` solo recoge tests/unit, que no salen de la máquina: Graph es
+# un httpx.MockTransport y MSAL, una aplicación sin sesión. Por eso el job no
+# lleva secretos ni cuenta de Microsoft.
+#
+# Las de integración, en tests/integracion, no se ejecutan aquí nunca: escriben
+# en el buzón de la cuenta autorizada y responden correos. `testpaths` las deja
+# fuera y, si algo llegara a recogerlas, su módulo sale con error sin
+# MICROSOFT_MCP_PRUEBAS_REALES=si, que no se pone nunca en este fichero.
+#
+# En un fork, GitHub no ejecuta workflows hasta que se activa Actions en su
+# pestaña Actions. Mientras tanto, las pruebas se ejecutan a mano antes de unir.
+
+name: pruebas
+
+# push prueba la rama tal cual; pull_request, cómo queda unida a master
+on:
+  push:
+  pull_request:
+
+# el job solo lee el código
+permissions:
+  contents: read
+
+jobs:
+  pruebas:
+    runs-on: ubuntu-latest
+    # tardan segundos: si algo se queda esperando, se corta aquí y no a las
+    # 6 horas por defecto
+    timeout-minutes: 10
+    steps:
+      # sin dejar el token de GitHub en .git/config: ningún paso lo usa
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v5
+
+      # Python, el de .python-version (3.12), el mismo que la imagen de
+      # radon-api; las dependencias, las del uv.lock tal cual. --frozen en los
+      # dos pasos, para que `uv run` tampoco vuelva a resolver.
+      - name: Sincronizar dependencias
+        run: uv sync --frozen
+
+      - name: Pruebas unitarias
+        run: uv run --frozen pytest
