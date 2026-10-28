@@ -3,7 +3,7 @@
 import httpx
 import pytest
 
-from microsoft_mcp import graph, tools
+from microsoft_mcp import graph
 
 
 def test_un_get_que_da_503_se_reintenta_y_acaba_bien(graph_simulado):
@@ -45,37 +45,6 @@ def test_un_post_que_da_502_no_se_repite(graph_simulado):
     assert error.value.response.status_code == 502
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "/v1.0/drives/drive-1/root/children"),
-    ]
-    assert graph_simulado.esperas == []
-
-
-@pytest.mark.parametrize("con_adjunto", [False, True], ids=["aviso", "impresora"])
-def test_send_email_hace_un_solo_post_aunque_graph_de_502(
-    graph_simulado, tmp_path, con_adjunto
-):
-    """Por la función de la herramienta, como la usan los dos envíos de
-    radon-api: el aviso interno, sin adjuntos, y la impresora, con el PDF
-    adjunto. Si Graph lo mandó antes de contestar el 502, repetirlo sería un
-    segundo aviso o una segunda impresión."""
-    adjuntos = None
-    if con_adjunto:
-        pdf = tmp_path / "plano.pdf"
-        pdf.write_bytes(b"%PDF-1.7\n")
-        adjuntos = [str(pdf)]
-    graph_simulado.respuestas = [httpx.Response(502)]
-
-    with pytest.raises(httpx.HTTPStatusError) as error:
-        tools.send_email.fn(
-            account_id="cuenta-1",
-            to="destino@example.com",
-            subject="Asunto",
-            body="Cuerpo",
-            attachments=adjuntos,
-        )
-
-    assert error.value.response.status_code == 502
-    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
-        ("POST", "/v1.0/me/sendMail"),
     ]
     assert graph_simulado.esperas == []
 

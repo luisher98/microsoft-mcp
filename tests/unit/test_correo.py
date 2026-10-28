@@ -57,6 +57,63 @@ def impresion(adjunto: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
+    ("adjunto", "respuestas", "peticiones"),
+    [
+        pytest.param(
+            None,
+            [httpx.Response(502)],
+            [("POST", "/v1.0/me/sendMail")],
+            id="aviso",
+        ),
+        pytest.param(
+            9,
+            [httpx.Response(502)],
+            [("POST", "/v1.0/me/sendMail")],
+            id="impresora",
+        ),
+        pytest.param(
+            TRES_MIB + 1,
+            [
+                httpx.Response(201, json={"id": "m1"}),
+                httpx.Response(
+                    201, json={"uploadUrl": "https://subida.example.com/sesion-1"}
+                ),
+                httpx.Response(201, json={}),
+                httpx.Response(502),
+            ],
+            [
+                ("POST", "/v1.0/me/messages"),
+                ("POST", "/v1.0/me/messages/m1/attachments/createUploadSession"),
+                ("PUT", "/sesion-1"),
+                ("POST", "/v1.0/me/messages/m1/send"),
+            ],
+            id="impresora-grande",
+        ),
+    ],
+)
+def test_send_email_hace_un_solo_post_aunque_graph_de_502(
+    graph_simulado, tmp_path, adjunto, respuestas, peticiones
+):
+    """Por MCP y con los argumentos de los dos envíos de radon-api: el aviso del
+    RF-38, en HTML y sin adjuntos, y la impresora, con el PDF adjunto. Si Graph
+    lo mandó antes de contestar el 502, repetirlo sería un segundo aviso o una
+    segunda impresión.
+
+    Un PDF de 3 MiB o más no cabe en el sendMail: va en un borrador, con una
+    sesión de subida, y sale con /send, que tampoco se repite. El borrador ya
+    estaba completo, así que no se retira."""
+    argumentos = AVISO_RF38 if adjunto is None else impresion(pdf(tmp_path, adjunto))
+    graph_simulado.respuestas = list(respuestas)
+
+    resultado = llamar_por_mcp("send_email", argumentos)
+
+    assert resultado.isError
+    assert "502 Bad Gateway" in resultado.content[0].text
+    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == peticiones
+    assert graph_simulado.esperas == []
+
+
+@pytest.mark.parametrize(
     ("argumentos", "formato"),
     [
         pytest.param(AVISO_RF38, "HTML", id="aviso-rf38"),
