@@ -40,10 +40,12 @@ class AplicacionSinSesion:
         client_id: str,
         authority: str,
         token_cache: msal.SerializableTokenCache,
+        timeout: float,
     ) -> None:
         self.client_id = client_id
         self.authority = authority
         self.token_cache = token_cache
+        self.timeout = timeout
 
     def get_accounts(self) -> list[dict[str, str]]:
         return []

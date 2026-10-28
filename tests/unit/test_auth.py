@@ -109,6 +109,14 @@ def test_una_cuenta_que_no_esta_en_la_cache_es_sin_sesion(monkeypatch):
     assert AplicacionSinSesion.device_flows_pedidos == []
 
 
+def test_msal_no_espera_sin_limite_a_microsoft():
+    """MSAL habla con login.microsoftonline.com al crear la aplicación y, sin
+    sesión, al buscar cuentas en la caché vacía. Sin timeout, si Microsoft acepta
+    la conexión y no contesta, la llamada se colgaba hasta que radon-api la
+    cortaba a los 120 s en vez de fallar."""
+    assert auth.get_app().timeout == auth.TIMEOUT_MSAL
+
+
 @pytest.mark.parametrize(
     ("aplicacion", "token", "guardados"),
     [

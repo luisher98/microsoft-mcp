@@ -9,6 +9,12 @@ load_dotenv()
 
 CACHE_FILE = pl.Path.home() / ".microsoft_mcp_token_cache.json"
 SCOPES = ["https://graph.microsoft.com/.default"]
+# Segundos por petición a login.microsoftonline.com. MSAL pide allí la
+# configuración del tenant al crear la aplicación, los metadatos de instancia al
+# buscar cuentas en una caché vacía y el token al renovarlo, y sin timeout
+# requests espera para siempre: una llamada sin sesión se colgaría hasta que el
+# cliente la cortara (radon-api, a los 120 s) en vez de fallar.
+TIMEOUT_MSAL = 15
 
 
 class Account(NamedTuple):
@@ -53,7 +59,7 @@ def get_app() -> msal.PublicClientApplication:
         cache.deserialize(cache_content)
 
     app = msal.PublicClientApplication(
-        client_id, authority=authority, token_cache=cache
+        client_id, authority=authority, token_cache=cache, timeout=TIMEOUT_MSAL
     )
 
     return app
