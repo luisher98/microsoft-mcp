@@ -183,8 +183,8 @@ create_event(account_id, "Meeting", "2024-01-15T10:00:00Z", "2024-01-15T11:00:00
 ## Development
 
 ```bash
-# Run tests
-uv run pytest tests/ -v
+# Run the unit tests (see «Pruebas» below)
+uv run pytest -v
 
 # Type checking
 uv run pyright
@@ -195,6 +195,27 @@ uvx ruff format .
 # Lint
 uvx ruff check --fix --unsafe-fixes .
 ```
+
+## Pruebas
+
+`uv run pytest` ejecuta solo las pruebas unitarias, las de `tests/unit`: es lo
+que fija `testpaths` en `pyproject.toml`. No salen de la máquina. Graph es un
+`httpx.MockTransport` que contesta lo que cada prueba le prepara, MSAL es una
+aplicación sin sesión y la caché de tokens vive en un directorio temporal, así
+que no necesitan `MICROSOFT_MCP_CLIENT_ID` ni una cuenta autorizada.
+
+Las de integración, en `tests/integracion`, arrancan el servidor contra el buzón
+de la cuenta autorizada y lo cambian de verdad: crean, mueven y borran correos,
+responden a invitaciones y, si no encuentran un correo de prueba, contestan al
+último que haya llegado a la bandeja de entrada, también con «responder a
+todos». En este fork la cuenta autorizada es la de la oficina, con la que
+trabaja radon-api, así que no se ejecutan: contestarían a clientes.
+
+Para que no se ejecuten por descuido, el módulo no arranca sin
+`MICROSOFT_MCP_PRUEBAS_REALES=si` exportada a mano para esa ejecución. Sin ella,
+si `pytest` llega a recogerlas (se le pasa `tests/` o el propio fichero, o se
+lanza fuera de la raíz, donde `testpaths` no cuenta), sale con error en vez de
+saltarlas. Esa variable no se escribe en el `.env`.
 
 ## Example: AI Assistant Scenarios
 
