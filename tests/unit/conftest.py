@@ -6,16 +6,19 @@ temporal de cada prueba. Ninguna necesita una cuenta autorizada, ni ve la
 caché o el `.env` reales.
 """
 
+import asyncio
 import pathlib as pl
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import httpx
 import msal
 import pytest
+from fastmcp import Client
+from mcp.types import CallToolResult
 
-from microsoft_mcp import auth, graph
+from microsoft_mcp import auth, graph, tools
 
 TOKEN_DE_PRUEBA = "token-de-prueba"
 
@@ -105,3 +108,19 @@ def graph_simulado(monkeypatch: pytest.MonkeyPatch) -> Iterator[GraphSimulado]:
         monkeypatch.setattr(graph, "get_token", token_de_prueba)
         monkeypatch.setattr(graph.time, "sleep", simulado.esperas.append)
         yield simulado
+
+
+def llamar_por_mcp(herramienta: str, argumentos: dict[str, Any]) -> CallToolResult:
+    """Llama a la herramienta como radon-api: por MCP, con un cliente de FastMCP.
+
+    Así FastMCP valida los argumentos contra la firma de la herramienta, como en
+    producción, y un fallo llega como un resultado de error con su texto, que es
+    lo que lee radon-api. Llamar a la función que hay detrás se saltaría las dos
+    cosas.
+    """
+
+    async def llamar() -> CallToolResult:
+        async with Client(tools.mcp) as cliente:
+            return await cliente.call_tool_mcp(herramienta, argumentos)
+
+    return asyncio.run(llamar())

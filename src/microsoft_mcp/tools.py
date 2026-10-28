@@ -210,6 +210,27 @@ def get_email(
     return result
 
 
+def _retirar_borrador_a_medias(
+    message_id: str, account_id: str, error: Exception
+) -> None:
+    """Retira el borrador que `error` ha dejado a medias, antes de que el error suba.
+
+    Un POST que Graph contesta con un 5xx no se repite (graph.py), así que una
+    sesión de subida que falla deja el borrador creado, dirigido a quien iba y
+    sin su adjunto. Quien llama solo recibe el error, sin el id del borrador:
+    no podría retirarlo, y si repite crea otro. El DELETE sí se repite tras un
+    5xx, porque no duplica nada; si aun así falla, el error lleva el id para
+    retirarlo a mano.
+    """
+    try:
+        graph.request("DELETE", f"/me/messages/{message_id}", account_id)
+    except Exception as fallo:
+        raise RuntimeError(
+            f"{error}. Además, el borrador a medias {message_id} no se ha podido "
+            f"retirar ({fallo}): sigue en Borradores y hay que borrarlo a mano"
+        ) from fallo
+
+
 @mcp.tool
 def create_email_draft(
     account_id: str,
@@ -274,14 +295,18 @@ def create_email_draft(
 
     message_id = result["id"]
 
-    for att in large_attachments:
-        graph.upload_large_mail_attachment(
-            message_id,
-            att["name"],
-            att["content_bytes"],
-            account_id,
-            att.get("content_type", "application/octet-stream"),
-        )
+    try:
+        for att in large_attachments:
+            graph.upload_large_mail_attachment(
+                message_id,
+                att["name"],
+                att["content_bytes"],
+                account_id,
+                att.get("content_type", "application/octet-stream"),
+            )
+    except Exception as error:
+        _retirar_borrador_a_medias(message_id, account_id, error)
+        raise
 
     return result
 
@@ -369,30 +394,37 @@ def send_email(
 
         message_id = result["id"]
 
-        for att in processed_attachments:
-            if att["size"] >= 3 * 1024 * 1024:
-                graph.upload_large_mail_attachment(
-                    message_id,
-                    att["name"],
-                    att["content_bytes"],
-                    account_id,
-                    att.get("content_type", "application/octet-stream"),
-                )
-            else:
-                small_att = {
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": att["name"],
-                    "contentBytes": base64.b64encode(att["content_bytes"]).decode(
-                        "utf-8"
-                    ),
-                }
-                graph.request(
-                    "POST",
-                    f"/me/messages/{message_id}/attachments",
-                    account_id,
-                    json=small_att,
-                )
+        try:
+            for att in processed_attachments:
+                if att["size"] >= 3 * 1024 * 1024:
+                    graph.upload_large_mail_attachment(
+                        message_id,
+                        att["name"],
+                        att["content_bytes"],
+                        account_id,
+                        att.get("content_type", "application/octet-stream"),
+                    )
+                else:
+                    small_att = {
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": att["name"],
+                        "contentBytes": base64.b64encode(att["content_bytes"]).decode(
+                            "utf-8"
+                        ),
+                    }
+                    graph.request(
+                        "POST",
+                        f"/me/messages/{message_id}/attachments",
+                        account_id,
+                        json=small_att,
+                    )
+        except Exception as error:
+            _retirar_borrador_a_medias(message_id, account_id, error)
+            raise
 
+        # Fuera del try: si el /send falla, Graph pudo mandarlo antes de
+        # contestar. No se sabe si salió, y el borrador ya está completo, así
+        # que se deja como está.
         graph.request("POST", f"/me/messages/{message_id}/send", account_id)
         return {"status": "sent"}
     else:
