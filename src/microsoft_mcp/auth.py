@@ -1,18 +1,33 @@
 import os
+import sys
 import msal
 import pathlib as pl
 from typing import NamedTuple
-from dotenv import load_dotenv
-
-load_dotenv()
 
 CACHE_FILE = pl.Path.home() / ".microsoft_mcp_token_cache.json"
 SCOPES = ["https://graph.microsoft.com/.default"]
+# Segundos por petición a login.microsoftonline.com. MSAL pide allí la
+# configuración del tenant al crear la aplicación, los metadatos de instancia al
+# buscar cuentas en una caché vacía y el token al renovarlo, y sin timeout
+# requests espera para siempre: una llamada sin sesión se colgaría hasta que el
+# cliente la cortara (radon-api, a los 120 s) en vez de fallar.
+TIMEOUT_MSAL = 15
 
 
 class Account(NamedTuple):
     username: str
     account_id: str
+
+
+class SinSesion(RuntimeError):
+    """La caché de tokens no tiene sesión para la cuenta: hay que autorizarla.
+
+    `get_token` no la pide con un device flow. En un servidor stdio, stdout es
+    el canal del protocolo y nadie vería el código, así que la llamada se
+    quedaría esperándolo hasta que el cliente la cortara. Se autoriza con
+    `authenticate.py`, o con las herramientas `authenticate_account` y
+    `complete_authentication`, que escriben en la misma caché.
+    """
 
 
 def _read_cache() -> str | None:
@@ -41,13 +56,18 @@ def get_app() -> msal.PublicClientApplication:
         cache.deserialize(cache_content)
 
     app = msal.PublicClientApplication(
-        client_id, authority=authority, token_cache=cache
+        client_id, authority=authority, token_cache=cache, timeout=TIMEOUT_MSAL
     )
 
     return app
 
 
 def get_token(account_id: str | None = None) -> str:
+    """El token de la cuenta: el de la caché, o uno renovado sin preguntar a nadie.
+
+    Sin `account_id`, el de la primera cuenta de la caché. Si no hay sesión,
+    avisa por stderr y lanza `SinSesion`.
+    """
     app = get_app()
 
     accounts = app.get_accounts()
@@ -63,24 +83,13 @@ def get_token(account_id: str | None = None) -> str:
     result = app.acquire_token_silent(SCOPES, account=account)
 
     if not result:
-        flow = app.initiate_device_flow(scopes=SCOPES)
-        if "user_code" not in flow:
-            raise Exception(
-                f"Failed to get device code: {flow.get('error_description', 'Unknown error')}"
-            )
-        verification_uri = flow.get(
-            "verification_uri",
-            flow.get("verification_url", "https://microsoft.com/devicelogin"),
+        mensaje = (
+            f"microsoft-mcp: no hay sesión de Microsoft en {CACHE_FILE} para la "
+            f"cuenta {account_id or 'por defecto'}: hay que autorizar de nuevo; "
+            "un servidor stdio no puede pedir el código"
         )
-        print(
-            f"\nTo authenticate:\n1. Visit {verification_uri}\n2. Enter code: {flow['user_code']}"
-        )
-        result = app.acquire_token_by_device_flow(flow)
-
-    if "error" in result:
-        raise Exception(
-            f"Auth failed: {result.get('error_description', result['error'])}"
-        )
+        print(mensaje, file=sys.stderr)
+        raise SinSesion(mensaje)
 
     cache = app.token_cache
     if isinstance(cache, msal.SerializableTokenCache) and cache.has_state_changed:

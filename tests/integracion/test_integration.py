@@ -7,6 +7,16 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from dotenv import load_dotenv
 
+# Arrancan el servidor contra el buzón de la cuenta autorizada: crean, mueven y
+# borran correos y responden a mensajes. Por eso no arrancan sin la variable,
+# que se exporta a mano para cada ejecución; se mira antes de cargar el .env,
+# que no es sitio para ella.
+if os.getenv("MICROSOFT_MCP_PRUEBAS_REALES") != "si":
+    pytest.exit(
+        "Las pruebas de integración no arrancan sin MICROSOFT_MCP_PRUEBAS_REALES=si: "
+        "escriben en el buzón de la cuenta autorizada y responden correos."
+    )
+
 load_dotenv()
 
 if not os.getenv("MICROSOFT_MCP_CLIENT_ID"):

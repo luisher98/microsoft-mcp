@@ -1,0 +1,80 @@
+# Las pruebas unitarias en cada push y en cada PR (README, «Pruebas»), con las
+# dependencias del uv.lock y con las que instala radon-api.
+#
+# `pytest` solo recoge tests/unit, que no salen de la máquina: Graph es un
+# httpx.MockTransport y MSAL, una aplicación sin sesión. Por eso los jobs no
+# llevan secretos ni cuenta de Microsoft.
+#
+# Las de integración, en tests/integracion, no se ejecutan aquí nunca: escriben
+# en el buzón de la cuenta autorizada y responden correos. `testpaths` las deja
+# fuera y, si algo llegara a recogerlas, su módulo sale con error sin
+# MICROSOFT_MCP_PRUEBAS_REALES=si, que no se pone nunca en este fichero.
+#
+# En un fork, GitHub no ejecuta workflows hasta que se activa Actions en su
+# pestaña Actions. Mientras tanto, las pruebas se ejecutan a mano antes de unir.
+
+name: pruebas
+
+# push prueba la rama tal cual; pull_request, cómo queda unida a master
+on:
+  push:
+  pull_request:
+
+# los jobs solo leen el código
+permissions:
+  contents: read
+
+jobs:
+  pruebas:
+    runs-on: ubuntu-latest
+    # tardan segundos: si algo se queda esperando, se corta aquí y no a las
+    # 6 horas por defecto
+    timeout-minutes: 10
+    steps:
+      # sin dejar el token de GitHub en .git/config: ningún paso lo usa
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v5
+
+      # Python, el de .python-version (3.12), el mismo que la imagen de
+      # radon-api; las dependencias, las del uv.lock tal cual. --frozen en los
+      # dos pasos, para que `uv run` tampoco vuelva a resolver.
+      - name: Sincronizar dependencias
+        run: uv sync --frozen
+
+      - name: Pruebas unitarias
+        run: uv run --frozen pytest
+
+  # Las mismas pruebas con las dependencias que corren en producción. radon-api
+  # no instala el fork con este uv.lock: lo instala desde git con `uv pip
+  # install --exclude-newer` y su MICROSOFT_MCP_FECHA (Dockerfile.api y
+  # Dockerfile.worker), y con esa fecha fastmcp>=2.8.0 resuelve a 3.x, no a la
+  # 2.8.0 del lock. Las pruebas de correo entran por FastMCP, como radon-api, así
+  # que su versión cuenta.
+  como-radon-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # la MICROSOFT_MCP_FECHA de los dos Dockerfile de radon-api: si cambia
+      # allí, se cambia aquí
+      MICROSOFT_MCP_FECHA: "2026-08-12"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v5
+
+      # sin el lock y sin el grupo dev, como la imagen: el fork sin -e y, de
+      # más, solo pytest, todo resuelto con la misma fecha de corte
+      - name: Instalar como radon-api
+        run: |
+          uv venv
+          uv pip install --exclude-newer "$MICROSOFT_MCP_FECHA" . pytest
+
+      - name: Pruebas unitarias
+        run: .venv/bin/pytest
