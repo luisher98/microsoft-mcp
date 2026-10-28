@@ -82,7 +82,8 @@ def test_sin_sesion_falla_al_momento_sin_escribir_en_stdout(capsys, account_id, 
     """La caché está vacía: la `AplicacionSinSesion` del conftest. Antes se abría
     aquí un device flow, su código salía por stdout y la llamada lo esperaba
     hasta que radon-api la cortaba a los 120 s. Si se pide, salta el cable
-    trampa y la prueba falla con su AssertionError."""
+    trampa: queda apuntado y la prueba falla, aunque el código lo envuelva en un
+    `except Exception`."""
     with pytest.raises(auth.SinSesion) as error:
         auth.get_token(account_id)
 
@@ -94,6 +95,7 @@ def test_sin_sesion_falla_al_momento_sin_escribir_en_stdout(capsys, account_id, 
     salida = capsys.readouterr()
     assert salida.out == ""
     assert salida.err == f"{error.value}\n"
+    assert AplicacionSinSesion.device_flows_pedidos == []
 
 
 def test_una_cuenta_que_no_esta_en_la_cache_es_sin_sesion(monkeypatch):
@@ -103,6 +105,8 @@ def test_una_cuenta_que_no_esta_en_la_cache_es_sin_sesion(monkeypatch):
 
     with pytest.raises(auth.SinSesion, match="para la cuenta cuenta-2:"):
         auth.get_token("cuenta-2")
+
+    assert AplicacionSinSesion.device_flows_pedidos == []
 
 
 @pytest.mark.parametrize(

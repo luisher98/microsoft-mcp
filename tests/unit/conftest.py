@@ -10,7 +10,7 @@ import asyncio
 import pathlib as pl
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, NoReturn
+from typing import Any, ClassVar, NoReturn
 
 import httpx
 import msal
@@ -27,8 +27,13 @@ class AplicacionSinSesion:
     """Ocupa el sitio de `msal.PublicClientApplication`: una caché sin cuentas.
 
     No tiene token que dar, y pedirle un device flow es un cable trampa: en una
-    prueba unitaria nadie va a teclear el código.
+    prueba unitaria nadie va a teclear el código. Cada paso que se pida queda
+    apuntado en `device_flows_pedidos`, que `auth_hermetica` vacía en cada
+    prueba, y la prueba falla con `pytest.fail`, que es un BaseException: un
+    `except Exception` del código no se lo traga.
     """
+
+    device_flows_pedidos: ClassVar[list[str]] = []
 
     def __init__(
         self,
@@ -49,8 +54,16 @@ class AplicacionSinSesion:
         return None
 
     def initiate_device_flow(self, scopes: list[str]) -> NoReturn:
-        raise AssertionError(
+        self.device_flows_pedidos.append("initiate_device_flow")
+        pytest.fail(
             "una prueba unitaria pidió un device flow: nadie va a teclear el código"
+        )
+
+    def acquire_token_by_device_flow(self, flow: dict[str, Any]) -> NoReturn:
+        self.device_flows_pedidos.append("acquire_token_by_device_flow")
+        pytest.fail(
+            "una prueba unitaria esperó el código de un device flow: nadie lo va a "
+            "teclear"
         )
 
 
@@ -60,12 +73,14 @@ def auth_hermetica(monkeypatch: pytest.MonkeyPatch, tmp_path: pl.Path) -> None:
 
     `auth` carga el `.env` al importarse; el client id de prueba y el tenant por
     defecto tapan lo que traiga. La caché de tokens es un fichero del directorio
-    temporal, y MSAL, una aplicación sin sesión.
+    temporal, y MSAL, una aplicación sin sesión, con su lista de device flows
+    pedidos vacía.
     """
     monkeypatch.setenv("MICROSOFT_MCP_CLIENT_ID", "client-id-de-prueba")
     monkeypatch.delenv("MICROSOFT_MCP_TENANT_ID", raising=False)
     monkeypatch.setattr(auth, "CACHE_FILE", tmp_path / "token_cache.json")
     monkeypatch.setattr(msal, "PublicClientApplication", AplicacionSinSesion)
+    monkeypatch.setattr(AplicacionSinSesion, "device_flows_pedidos", [])
 
 
 @dataclass
