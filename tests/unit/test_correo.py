@@ -1,6 +1,7 @@
 """Las herramientas de correo que usa radon-api, llamadas como las llama él: por
 MCP y con sus mismos argumentos."""
 
+import json
 import pathlib as pl
 from typing import Any
 
@@ -12,6 +13,17 @@ from .conftest import llamar_por_mcp
 # Desde aquí, un adjunto no va dentro del POST: el mensaje se crea como borrador
 # y el adjunto se sube después, con una sesión de subida (tools.py).
 TRES_MIB = 3 * 1024 * 1024
+
+# Los argumentos de `enviar_interno` (radon-api, conectores/correo.py): el aviso
+# interno del RF-38, tres enlaces en HTML y sin adjuntos. `account_id` lo pone
+# `_llamar`.
+AVISO_RF38 = {
+    "to": "info@example.com",
+    "subject": "Informe desatendido generado — Cliente",
+    "body": '<p><a href="https://example.com/informe.docx">DOCX</a></p>',
+    "content_type": "HTML",
+    "account_id": "cuenta-1",
+}
 
 
 def pdf(tmp_path: pl.Path, tamano: int) -> str:
@@ -41,6 +53,37 @@ def impresion(adjunto: str) -> dict[str, Any]:
         "subject": "plano.pdf",
         "body": "plano.pdf",
         "attachments": [adjunto],
+    }
+
+
+@pytest.mark.parametrize(
+    ("argumentos", "formato"),
+    [
+        pytest.param(AVISO_RF38, "HTML", id="aviso-rf38"),
+        pytest.param(
+            {k: v for k, v in AVISO_RF38.items() if k != "content_type"},
+            "Text",
+            id="sin-content-type",
+        ),
+    ],
+)
+def test_send_email_manda_el_cuerpo_en_html_si_se_le_pide(
+    graph_simulado, argumentos, formato
+):
+    """radon-api manda el aviso del RF-38 con content_type="HTML". Sin ese
+    parámetro, FastMCP rechazaba la llamada al validar los argumentos, antes de
+    llegar a Graph, y el aviso no salía nunca. Sin content_type, el cuerpo sigue
+    yendo en texto, como el de la impresora."""
+    graph_simulado.respuestas = [httpx.Response(202)]
+
+    resultado = llamar_por_mcp("send_email", argumentos)
+
+    assert not resultado.isError, resultado.content
+    (peticion,) = graph_simulado.peticiones
+    assert (peticion.method, peticion.url.path) == ("POST", "/v1.0/me/sendMail")
+    assert json.loads(peticion.content)["message"]["body"] == {
+        "contentType": formato,
+        "content": argumentos["body"],
     }
 
 

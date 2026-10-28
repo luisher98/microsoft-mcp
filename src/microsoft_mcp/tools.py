@@ -2,7 +2,7 @@ import base64
 import datetime as dt
 import pathlib as pl
 import httpx
-from typing import Any
+from typing import Any, Literal
 from fastmcp import FastMCP
 from . import graph, auth
 
@@ -319,13 +319,17 @@ def send_email(
     body: str,
     cc: str | list[str] | None = None,
     attachments: str | list[str] | None = None,
+    content_type: Literal["Text", "HTML"] = "Text",
 ) -> dict[str, str]:
-    """Send an email immediately with file path(s) as attachments"""
+    """Send an email immediately with file path(s) as attachments
+
+    The body is plain text unless content_type is "HTML".
+    """
     to_list = [to] if isinstance(to, str) else to
 
     message = {
         "subject": subject,
-        "body": {"contentType": "Text", "content": body},
+        "body": {"contentType": content_type, "content": body},
         "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_list],
     }
 
@@ -379,7 +383,7 @@ def send_email(
         to_list = [to] if isinstance(to, str) else to
         message = {
             "subject": subject,
-            "body": {"contentType": "Text", "content": body},
+            "body": {"contentType": content_type, "content": body},
             "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_list],
         }
         if cc:
