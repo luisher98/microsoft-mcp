@@ -105,10 +105,10 @@ def test_send_email_hace_un_solo_post_aunque_graph_de_502(
     argumentos = AVISO_RF38 if adjunto is None else impresion(pdf(tmp_path, adjunto))
     graph_simulado.respuestas = list(respuestas)
 
-    resultado = llamar_por_mcp("send_email", argumentos)
+    error = llamar_por_mcp("send_email", argumentos)
 
-    assert resultado.isError
-    assert "502 Bad Gateway" in resultado.content[0].text
+    assert error is not None
+    assert "502 Bad Gateway" in error
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == peticiones
     assert graph_simulado.esperas == []
 
@@ -133,9 +133,7 @@ def test_send_email_manda_el_cuerpo_en_html_si_se_le_pide(
     yendo en texto, como el de la impresora."""
     graph_simulado.respuestas = [httpx.Response(202)]
 
-    resultado = llamar_por_mcp("send_email", argumentos)
-
-    assert not resultado.isError, resultado.content
+    assert llamar_por_mcp("send_email", argumentos) is None
     (peticion,) = graph_simulado.peticiones
     assert (peticion.method, peticion.url.path) == ("POST", "/v1.0/me/sendMail")
     assert json.loads(peticion.content)["message"]["body"] == {
@@ -167,10 +165,10 @@ def test_si_falla_la_subida_de_un_adjunto_grande_el_borrador_se_retira(
         httpx.Response(204),
     ]
 
-    resultado = llamar_por_mcp(herramienta, argumentos(pdf(tmp_path, TRES_MIB + 1)))
+    error = llamar_por_mcp(herramienta, argumentos(pdf(tmp_path, TRES_MIB + 1)))
 
-    assert resultado.isError
-    assert "502 Bad Gateway" in resultado.content[0].text
+    assert error is not None
+    assert "502 Bad Gateway" in error
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "/v1.0/me/messages"),
         ("POST", "/v1.0/me/messages/m1/attachments/createUploadSession"),
@@ -191,13 +189,12 @@ def test_si_tampoco_se_puede_retirar_el_borrador_el_error_dice_cual_es(
         *[httpx.Response(503) for _ in range(4)],
     ]
 
-    resultado = llamar_por_mcp(herramienta, argumentos(pdf(tmp_path, TRES_MIB + 1)))
+    error = llamar_por_mcp(herramienta, argumentos(pdf(tmp_path, TRES_MIB + 1)))
 
-    assert resultado.isError
-    texto = resultado.content[0].text
-    assert "502 Bad Gateway" in texto
-    assert "el borrador a medias m1 no se ha podido retirar" in texto
-    assert "hay que borrarlo a mano" in texto
+    assert error is not None
+    assert "502 Bad Gateway" in error
+    assert "el borrador a medias m1 no se ha podido retirar" in error
+    assert "hay que borrarlo a mano" in error
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "/v1.0/me/messages"),
         ("POST", "/v1.0/me/messages/m1/attachments/createUploadSession"),
@@ -217,11 +214,10 @@ def test_un_borrador_con_un_adjunto_grande_que_sube_bien_se_queda(
         httpx.Response(201, json={}),
     ]
 
-    resultado = llamar_por_mcp(
-        "create_email_draft", borrador(pdf(tmp_path, TRES_MIB + 1))
+    assert (
+        llamar_por_mcp("create_email_draft", borrador(pdf(tmp_path, TRES_MIB + 1)))
+        is None
     )
-
-    assert not resultado.isError, resultado.content
     assert [(p.method, p.url.host, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "graph.microsoft.com", "/v1.0/me/messages"),
         (

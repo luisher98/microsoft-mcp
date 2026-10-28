@@ -18,7 +18,7 @@ import httpx
 import msal
 import pytest
 from fastmcp import Client
-from mcp.types import CallToolResult
+from fastmcp.exceptions import ToolError
 
 from microsoft_mcp import auth, graph, tools
 
@@ -135,17 +135,25 @@ def graph_simulado(monkeypatch: pytest.MonkeyPatch) -> Iterator[GraphSimulado]:
         yield simulado
 
 
-def llamar_por_mcp(herramienta: str, argumentos: dict[str, Any]) -> CallToolResult:
-    """Llama a la herramienta como radon-api: por MCP, con un cliente de FastMCP.
+def llamar_por_mcp(herramienta: str, argumentos: dict[str, Any]) -> str | None:
+    """Llama a la herramienta como radon-api, por MCP, y da el texto del error con
+    que contesta, o None si sale bien.
 
     Así FastMCP valida los argumentos contra la firma de la herramienta, como en
-    producción, y un fallo llega como un resultado de error con su texto, que es
-    lo que lee radon-api. Llamar a la función que hay detrás se saltaría las dos
-    cosas.
+    producción, y un fallo llega con el texto que lee radon-api. Llamar a la
+    función que hay detrás se saltaría las dos cosas.
+
+    Solo usa `Client.call_tool` y su `ToolError`, que se comportan igual en el
+    FastMCP del uv.lock y en el que instala radon-api. Los tipos de mcp no: en
+    mcp 2.0, `CallToolResult.isError` pasa a llamarse `is_error`.
     """
 
-    async def llamar() -> CallToolResult:
+    async def llamar() -> str | None:
         async with Client(tools.mcp) as cliente:
-            return await cliente.call_tool_mcp(herramienta, argumentos)
+            try:
+                await cliente.call_tool(herramienta, argumentos)
+            except ToolError as error:
+                return str(error)
+            return None
 
     return asyncio.run(llamar())
