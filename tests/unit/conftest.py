@@ -72,11 +72,14 @@ def auth_hermetica(monkeypatch: pytest.MonkeyPatch, tmp_path: pl.Path) -> None:
 class GraphSimulado:
     """Graph sin red: contesta, por orden, las respuestas que la prueba le prepara.
 
-    `peticiones` apunta cada petición que le llega, y `esperas`, los segundos que
-    `graph` habría dormido antes de reintentar.
+    Si lo que toca es un `httpx.TransportError`, lo lanza, como un corte de la
+    conexión. `peticiones` apunta cada petición que le llega, y `esperas`, los
+    segundos que `graph` habría dormido antes de reintentar.
     """
 
-    respuestas: list[httpx.Response] = field(default_factory=list)
+    respuestas: list[httpx.Response | httpx.TransportError] = field(
+        default_factory=list
+    )
     peticiones: list[httpx.Request] = field(default_factory=list)
     esperas: list[float] = field(default_factory=list)
 
@@ -86,7 +89,10 @@ class GraphSimulado:
             raise AssertionError(
                 f"Graph no tenía respuesta preparada para {peticion.method} {peticion.url}"
             )
-        return self.respuestas.pop(0)
+        respuesta = self.respuestas.pop(0)
+        if isinstance(respuesta, httpx.TransportError):
+            raise respuesta
+        return respuesta
 
 
 def token_de_prueba(account_id: str | None = None) -> str:

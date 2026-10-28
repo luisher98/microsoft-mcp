@@ -49,6 +49,37 @@ def test_un_post_que_da_502_no_se_repite(graph_simulado):
     assert graph_simulado.esperas == []
 
 
+@pytest.mark.parametrize("corte", [httpx.ReadTimeout, httpx.RemoteProtocolError])
+@pytest.mark.parametrize(
+    ("metodo", "ruta", "cuerpo"),
+    [
+        pytest.param(
+            "POST", "/me/sendMail", {"message": {"subject": "Aviso"}}, id="POST"
+        ),
+        pytest.param("GET", "/drives/drive-1/root:/informes", None, id="GET"),
+    ],
+)
+def test_un_corte_no_repite_la_peticion(graph_simulado, metodo, ruta, cuerpo, corte):
+    """Si la conexión se corta mientras se espera la respuesta, Graph pudo
+    recibir la petición entera y hacer el trabajo: un sendMail cortado puede
+    haber salido. `graph.request` no captura los errores de red, y httpx solo
+    reintenta al conectar, antes de mandar nada. El corte llega a quien llama
+    sin repetir nada, tampoco un GET. Si algún día los GET aguantan cortes, el
+    POST tiene que seguir sin repetirse."""
+    graph_simulado.respuestas = [
+        corte("la conexión se cortó"),
+        httpx.Response(200, json={}),
+    ]
+
+    with pytest.raises(corte):
+        graph.request(metodo, ruta, "cuenta-1", json=cuerpo)
+
+    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
+        (metodo, f"/v1.0{ruta}"),
+    ]
+    assert graph_simulado.esperas == []
+
+
 def test_un_429_se_reintenta_aunque_sea_post_y_respeta_retry_after(graph_simulado):
     """Con un 429, Graph rechazó la petición sin procesarla: repetirla no
     duplica nada, después de esperar lo que pide."""
