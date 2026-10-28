@@ -3,9 +3,6 @@ import sys
 import msal
 import pathlib as pl
 from typing import NamedTuple
-from dotenv import load_dotenv
-
-load_dotenv()
 
 CACHE_FILE = pl.Path.home() / ".microsoft_mcp_token_cache.json"
 SCOPES = ["https://graph.microsoft.com/.default"]

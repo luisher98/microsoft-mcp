@@ -2,8 +2,10 @@
 
 Graph es un `httpx.MockTransport` que contesta lo que cada prueba le prepara,
 MSAL es una aplicación sin sesión y la caché de tokens vive en el directorio
-temporal de cada prueba. Ninguna necesita una cuenta autorizada, ni ve la
-caché o el `.env` reales.
+temporal de cada prueba. Ninguna necesita una cuenta autorizada ni lee la caché
+real, y el `.env` no entra en su entorno: lo carga `server.main()` al arrancar
+el servidor, no la importación del paquete. FastMCP sí busca en el `.env` del
+directorio actual sus propios ajustes, los `FASTMCP_*`, sin pasarlos al entorno.
 """
 
 import asyncio
@@ -73,8 +75,8 @@ class AplicacionSinSesion:
 def auth_hermetica(monkeypatch: pytest.MonkeyPatch, tmp_path: pl.Path) -> None:
     """Ninguna prueba llega a la cuenta autorizada.
 
-    `auth` carga el `.env` al importarse; el client id de prueba y el tenant por
-    defecto tapan lo que traiga. La caché de tokens es un fichero del directorio
+    El client id de prueba y el tenant por defecto tapan los que traiga el
+    entorno de quien las ejecuta. La caché de tokens es un fichero del directorio
     temporal, y MSAL, una aplicación sin sesión, con su lista de device flows
     pedidos vacía.
     """
