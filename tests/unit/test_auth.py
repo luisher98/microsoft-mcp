@@ -236,6 +236,87 @@ def test_si_microsoft_no_renueva_la_sesion_es_sin_sesion_y_dice_por_que(
     assert AplicacionSinSesion.device_flows_pedidos == []
 
 
+def aplicacion_sin_microsoft(paso: str, fallo: Exception) -> type[AplicacionConSesion]:
+    """Una caché con `CUENTA`, y Microsoft que falla antes de que haga falta
+    renovar nada: al crear la aplicación, cuando MSAL le pide la configuración
+    del tenant, o al buscar las cuentas, cuando le pide los metadatos de
+    instancia. MSAL lanza `fallo`."""
+
+    class AplicacionSinMicrosoft(AplicacionConSesion):
+        def __init__(
+            self,
+            client_id: str,
+            authority: str,
+            token_cache: msal.SerializableTokenCache,
+            timeout: float,
+        ) -> None:
+            if paso == "al-crearla":
+                raise fallo
+            super().__init__(client_id, authority, token_cache, timeout)
+
+        def get_accounts(self) -> list[dict[str, str]]:
+            if paso == "al-buscar-las-cuentas":
+                raise fallo
+            return super().get_accounts()
+
+    return AplicacionSinMicrosoft
+
+
+@pytest.mark.parametrize(
+    ("fallo", "motivo"),
+    [
+        pytest.param(
+            # como lo lanza MSAL, también con un 429 al buscar las cuentas
+            MsalServiceError("HTTP Error: 503", error=None, error_description=None),
+            "MsalServiceError: HTTP Error: 503",
+            id="un-5xx",
+        ),
+        pytest.param(
+            requests.exceptions.ConnectTimeout("login.microsoftonline.com"),
+            "ConnectTimeout: login.microsoftonline.com",
+            id="sin-respuesta",
+        ),
+    ],
+)
+@pytest.mark.parametrize("paso", ["al-crearla", "al-buscar-las-cuentas"])
+def test_si_microsoft_falla_antes_de_renovar_tambien_es_pasajero(
+    monkeypatch, capsys, paso, fallo, motivo
+):
+    """MSAL no solo habla con login.microsoftonline.com al renovar el token: al
+    crear la aplicación le pide la configuración del tenant, y al buscar las
+    cuentas, los metadatos de instancia. Como cada `get_token` crea la
+    aplicación, eso pasa más a menudo que renovar. Un 5xx o una red que no
+    contesta ahí salían tal cual, como `MsalServiceError: HTTP Error: 503` o
+    `ConnectTimeout`, sin decir que eran pasajeros."""
+    monkeypatch.setattr(
+        msal, "PublicClientApplication", aplicacion_sin_microsoft(paso, fallo)
+    )
+
+    with pytest.raises(auth.SinTokenPorAhora) as error:
+        auth.get_token("cuenta-1")
+
+    mensaje = str(error.value)
+    assert mensaje == (
+        "microsoft-mcp: Microsoft no ha dado ahora el token de la cuenta "
+        f"cuenta-1 ({motivo}): es pasajero, no falta la sesión; se repite más "
+        "tarde, sin autorizar nada"
+    )
+    salida = capsys.readouterr()
+    assert salida.out == ""
+    assert salida.err == f"{mensaje}\n"
+    assert refresh_tokens_guardados() is None
+
+
+def test_si_no_se_puede_leer_la_cache_no_es_cosa_de_microsoft():
+    """La caché es un fichero de esta máquina. Si no se puede leer, el error
+    sale tal cual, y no como si Microsoft no hubiera contestado: eso mandaría a
+    esperar algo que no se arregla solo."""
+    auth.CACHE_FILE.mkdir()
+
+    with pytest.raises(IsADirectoryError):
+        auth.get_token("cuenta-1")
+
+
 def test_por_mcp_el_fallo_pasajero_llega_sin_mandar_a_autorizar(
     monkeypatch, graph_simulado, tmp_path
 ):
