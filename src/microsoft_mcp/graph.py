@@ -13,16 +13,18 @@ METODOS_IDEMPOTENTES = frozenset({"GET", "HEAD", "PUT", "PATCH", "DELETE"})
 _client = httpx.Client(timeout=30.0, follow_redirects=True)
 
 
-def _se_reintenta(metodo: str, estado: int) -> bool:
+def _se_reintenta(metodo: str, estado: int, repetible: bool) -> bool:
     """Si `request` vuelve a pedir lo que Graph ha contestado con `estado`.
 
     Un 429, con cualquier método: Graph lo rechazó sin procesarlo. Un 5xx, solo
-    con un método idempotente, porque Graph pudo hacer el trabajo antes de
-    fallar: un POST a /me/sendMail repetido manda el correo otra vez.
+    si repetirlo no duplica nada, porque Graph pudo hacer el trabajo antes de
+    fallar: un POST a /me/sendMail repetido manda el correo otra vez. No lo
+    duplica un método idempotente, ni el POST que quien llama marca como
+    `repetible` porque sabe que ese en concreto no deja dos de nada.
     """
     if estado == 429:
         return True
-    return estado >= 500 and metodo in METODOS_IDEMPOTENTES
+    return estado >= 500 and (repetible or metodo in METODOS_IDEMPOTENTES)
 
 
 def request(
@@ -33,6 +35,7 @@ def request(
     json: dict[str, Any] | None = None,
     data: bytes | None = None,
     max_retries: int = 3,
+    repetible: bool = False,
 ) -> dict[str, Any] | None:
     headers = {
         "Authorization": f"Bearer {get_token(account_id)}",
@@ -67,7 +70,9 @@ def request(
             content=data,
         )
 
-        if retry_count < max_retries and _se_reintenta(method, response.status_code):
+        if retry_count < max_retries and _se_reintenta(
+            method, response.status_code, repetible
+        ):
             if response.status_code == 429:
                 retry_after = int(response.headers.get("Retry-After", "5"))
                 wait_time = min(retry_after, 60)
@@ -159,7 +164,19 @@ def _do_chunked_upload(
     data: bytes,
     headers: dict[str, str],
 ) -> dict[str, Any]:
-    """Internal helper for chunked uploads"""
+    """Sube `data` por trozos a una sesión de subida y devuelve lo que creó Graph:
+    el fichero del drive, o el adjunto del correo.
+
+    Solo un trozo que contesta 200 o 201 da por subido lo que se sube. Un trozo
+    se repite tras un 429 o un 5xx, con los mismos bytes al mismo tramo, así
+    que nada se escribe dos veces: si Graph lo había recibido antes de fallar,
+    contesta 416, y la subida acaba en ese error, sin el fichero. Un corte de
+    la conexión no se repite, como en `request`. La sesión que queda a medias
+    la descarta Microsoft cuando caduca.
+
+    Que la subida falle no siempre es que no se haya subido: tras un 5xx en el
+    último trozo, no se sabe si Graph llegó a crear el fichero antes de fallar.
+    """
     file_size = len(data)
 
     for i in range(0, file_size, UPLOAD_CHUNK_SIZE):
@@ -198,7 +215,10 @@ def _do_chunked_upload(
                     continue
                 raise
 
-    raise ValueError("Upload completed but no final response received")
+    raise ValueError(
+        "la sesión de subida ha recibido todos los trozos sin dar el fichero por "
+        "subido: no se ha subido"
+    )
 
 
 def create_upload_session(
@@ -206,9 +226,21 @@ def create_upload_session(
     account_id: str | None = None,
     item_properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create an upload session for large files"""
+    """Abre una sesión de subida en un drive para un fichero grande.
+
+    Se repite tras un 5xx aunque sea un POST: abrir la sesión no crea el
+    fichero, solo un sitio temporal donde esperan los trozos, y una sesión que
+    no recibe ninguno la descarta Microsoft cuando caduca. Repetirla deja como
+    mucho alguna sesión vacía, nunca dos ficheros.
+    """
     payload = {"item": item_properties or {}}
-    result = request("POST", f"{path}/createUploadSession", account_id, json=payload)
+    result = request(
+        "POST",
+        f"{path}/createUploadSession",
+        account_id,
+        json=payload,
+        repetible=True,
+    )
     if not result:
         raise ValueError("Failed to create upload session")
     return result

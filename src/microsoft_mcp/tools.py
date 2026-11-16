@@ -1023,37 +1023,63 @@ def unified_search(
 
 
 def _ensure_folder(account_id: str, drive_id: str, folder_path: str) -> None:
-    """Make sure every segment of folder_path exists in the drive, creating any
-    that are missing. Safe to call repeatedly (existing folders are left
-    untouched)."""
+    """Crea en el drive las carpetas de `folder_path` que falten.
+
+    La que ya existe se da por buena, también si aparece entre el GET que no la
+    encuentra y el POST que la crea: con dos subidas a la vez a una carpeta
+    nueva, las dos van a crearla, y con `conflictBehavior=fail` la segunda
+    recibe un 409. Por eso el POST se repite tras un 5xx: si Graph la creó antes
+    de fallar, la repetición da ese 409, y nunca quedan dos carpetas.
+
+    Un 409 solo dice que con ese nombre ya hay algo, así que se vuelve a leer.
+    Si es un fichero, y no una carpeta, la subida falla aquí y lo dice, en vez
+    de después, con el error de Graph al subir dentro. Cualquier otro error al
+    crearla la hace fallar también.
+    """
     parent = ""
     for segment in [s for s in folder_path.strip("/").split("/") if s]:
         current = f"{parent}/{segment}" if parent else segment
-        try:
-            existing = graph.request(
-                "GET", f"/drives/{drive_id}/root:/{current}", account_id
-            )
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code != 404:
-                raise
-            existing = None
-        if not existing:
+        existing = _elemento_del_drive(account_id, drive_id, current)
+        if existing is None:
             children_endpoint = (
                 "/drives/{drive}/root/children".format(drive=drive_id)
                 if not parent
                 else f"/drives/{drive_id}/root:/{parent}:/children"
             )
-            graph.request(
-                "POST",
-                children_endpoint,
-                account_id,
-                json={
-                    "name": segment,
-                    "folder": {},
-                    "@microsoft.graph.conflictBehavior": "fail",
-                },
+            try:
+                graph.request(
+                    "POST",
+                    children_endpoint,
+                    account_id,
+                    json={
+                        "name": segment,
+                        "folder": {},
+                        "@microsoft.graph.conflictBehavior": "fail",
+                    },
+                    repetible=True,
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 409:
+                    raise
+                existing = _elemento_del_drive(account_id, drive_id, current)
+        if existing is not None and "folder" not in existing:
+            raise ValueError(
+                f"en el drive, {current} es un fichero y no una carpeta: no se ha "
+                "subido nada"
             )
         parent = current
+
+
+def _elemento_del_drive(
+    account_id: str, drive_id: str, path: str
+) -> dict[str, Any] | None:
+    """El elemento del drive que hay en `path`, o None si no hay ninguno."""
+    try:
+        return graph.request("GET", f"/drives/{drive_id}/root:/{path}", account_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 404:
+            raise
+        return None
 
 
 @mcp.tool
