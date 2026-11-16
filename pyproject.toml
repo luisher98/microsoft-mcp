@@ -10,7 +10,9 @@ requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=2.8.0",
     "httpx>=0.28.1",
-    "msal>=1.32.3",
+    # la 1.32.3 lanzaba el 5xx al renovar el token como un KeyError, y no como
+    # el MsalServiceError que espera auth.get_token
+    "msal>=1.37.0",
     "python-dotenv>=1.1.0",
 ]
 

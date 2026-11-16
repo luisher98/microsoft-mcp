@@ -2,6 +2,7 @@ import os
 import sys
 import msal
 import pathlib as pl
+from msal.exceptions import MsalServiceError
 from typing import NamedTuple
 
 CACHE_FILE = pl.Path.home() / ".microsoft_mcp_token_cache.json"
@@ -12,6 +13,14 @@ SCOPES = ["https://graph.microsoft.com/.default"]
 # requests espera para siempre: una llamada sin sesión se colgaría hasta que el
 # cliente la cortara (radon-api, a los 120 s) en vez de fallar.
 TIMEOUT_MSAL = 15
+# Los errores de OAuth con que Microsoft dice que ahora no puede dar el token,
+# pero que lo dará: está ocupado o ha fallado él (RFC 6749 §4.1.2.1). Así le
+# llega a MSAL un 429 al renovar: como un error en la respuesta, no como una
+# excepción. Cualquier otro error al renovar es que la sesión ya no vale: un
+# refresh token caducado o revocado (invalid_grant), una política que pide
+# volver a entrar (interaction_required)... Son los mismos que separa radon-api
+# en conectores/graph.py.
+ERRORES_PASAJEROS = frozenset({"temporarily_unavailable", "server_error"})
 
 
 class Account(NamedTuple):
@@ -20,7 +29,8 @@ class Account(NamedTuple):
 
 
 class SinSesion(RuntimeError):
-    """La caché de tokens no tiene sesión para la cuenta: hay que autorizarla.
+    """La caché de tokens no tiene sesión para la cuenta, o Microsoft ya no la
+    renueva: hay que autorizarla.
 
     `get_token` no la pide con un device flow. En un servidor stdio, stdout es
     el canal del protocolo y nadie vería el código, así que la llamada se
@@ -28,6 +38,23 @@ class SinSesion(RuntimeError):
     `authenticate.py`, o con las herramientas `authenticate_account` y
     `complete_authentication`, que escriben en la misma caché.
     """
+
+
+class SinTokenPorAhora(RuntimeError):
+    """Microsoft no ha dado el token ahora, pero no es que falte la sesión: no
+    contestó, contestó con un 5xx o dijo que ahora no puede (un 429 al
+    renovar). Pasa solo, y se repite más tarde sin autorizar nada.
+
+    Antes era `SinSesion`, y su texto mandaba a autorizar de nuevo una sesión
+    que estaba bien.
+    """
+
+    def __init__(self, cuenta: str, motivo: str) -> None:
+        super().__init__(
+            f"microsoft-mcp: Microsoft no ha dado ahora el token de {cuenta} "
+            f"({motivo}): es pasajero, no falta la sesión; se repite más tarde, "
+            "sin autorizar nada"
+        )
 
 
 def _read_cache() -> str | None:
@@ -65,8 +92,9 @@ def get_app() -> msal.PublicClientApplication:
 def get_token(account_id: str | None = None) -> str:
     """El token de la cuenta: el de la caché, o uno renovado sin preguntar a nadie.
 
-    Sin `account_id`, el de la primera cuenta de la caché. Si no hay sesión,
-    avisa por stderr y lanza `SinSesion`.
+    Sin `account_id`, el de la primera cuenta de la caché. Si no hay sesión, o
+    Microsoft ya no la renueva, lanza `SinSesion`; si Microsoft no da el token
+    ahora pero lo dará, `SinTokenPorAhora`. Las dos, avisando por stderr.
     """
     app = get_app()
 
@@ -80,22 +108,48 @@ def get_token(account_id: str | None = None) -> str:
     elif accounts:
         account = accounts[0]
 
-    result = app.acquire_token_silent(SCOPES, account=account)
+    cuenta = f"la cuenta {account_id or 'por defecto'}"
+    try:
+        result = app.acquire_token_silent_with_error(SCOPES, account=account)
+    except (OSError, MsalServiceError) as e:
+        # Microsoft no contestó, o contestó con un 5xx: las excepciones de
+        # `requests`, el transporte de MSAL, son OSError, y el 5xx MSAL lo lanza
+        # como MsalServiceError
+        error = SinTokenPorAhora(cuenta, f"{type(e).__name__}: {e}")
+        print(error, file=sys.stderr)
+        raise error from e
 
-    if not result:
-        mensaje = (
-            f"microsoft-mcp: no hay sesión de Microsoft en {CACHE_FILE} para la "
-            f"cuenta {account_id or 'por defecto'}: hay que autorizar de nuevo; "
-            "un servidor stdio no puede pedir el código"
-        )
-        print(mensaje, file=sys.stderr)
-        raise SinSesion(mensaje)
+    if not result or "access_token" not in result:
+        error = _sin_token(cuenta, result)
+        print(error, file=sys.stderr)
+        raise error
 
     cache = app.token_cache
     if isinstance(cache, msal.SerializableTokenCache) and cache.has_state_changed:
         _write_cache(cache.serialize())
 
     return result["access_token"]
+
+
+def _sin_token(cuenta: str, result: dict | None) -> SinSesion | SinTokenPorAhora:
+    """Por qué MSAL no ha dado el token, según lo que ha devuelto: nada, si la
+    caché no tiene con qué pedirlo, o el error de Microsoft al renovarlo."""
+    if not result:
+        return SinSesion(
+            f"microsoft-mcp: no hay sesión de Microsoft en {CACHE_FILE} para "
+            f"{cuenta}: hay que autorizar de nuevo; un servidor stdio no puede "
+            "pedir el código"
+        )
+    # su código y su descripción (AADSTS…), tal cual los da Microsoft
+    partes = (result.get("error"), result.get("error_description"))
+    dice = ": ".join(str(p) for p in partes if p) or "sin más detalle"
+    if result.get("error") in ERRORES_PASAJEROS:
+        return SinTokenPorAhora(cuenta, dice)
+    return SinSesion(
+        f"microsoft-mcp: Microsoft no renueva la sesión de {CACHE_FILE} para "
+        f"{cuenta} ({dice}): hay que autorizar de nuevo; un servidor stdio no "
+        "puede pedir el código"
+    )
 
 
 def list_accounts() -> list[Account]:

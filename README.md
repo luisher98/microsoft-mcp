@@ -270,7 +270,13 @@ create_event(
 - **Authentication fails**: Check your CLIENT_ID is correct
 - **"Need admin approval"**: Use `MICROSOFT_MCP_TENANT_ID=consumers` for personal accounts
 - **Missing permissions**: Ensure all required API permissions are granted in Azure
-- **Token errors**: Delete `~/.microsoft_mcp_token_cache.json` and re-authenticate
+- **«no hay sesión de Microsoft» o «Microsoft no renueva la sesión»**: la caché
+  no tiene sesión para esa cuenta, o Microsoft ya no la renueva (el motivo va
+  en el error). Se autoriza de nuevo con `authenticate.py`, que escribe en la
+  misma caché: no hace falta borrarla.
+- **«Microsoft no ha dado ahora el token»**: es pasajero (un 429 o un 5xx al
+  renovar, o Microsoft que no contesta) y la sesión sigue en la caché. Se
+  repite más tarde, sin autorizar nada.
 
 ## License
 
