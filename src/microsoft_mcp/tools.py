@@ -212,23 +212,60 @@ def get_email(
 
 def _retirar_borrador_a_medias(
     message_id: str, account_id: str, error: Exception
-) -> None:
-    """Retira el borrador que `error` ha dejado a medias, antes de que el error suba.
+) -> RuntimeError:
+    """Retira el borrador que `error` ha dejado a medias, y devuelve el error con
+    que falla la llamada: el de `error`, y qué ha sido del borrador.
 
-    Un POST que Graph contesta con un 5xx no se repite (graph.py), así que una
-    sesión de subida que falla deja el borrador creado, dirigido a quien iba y
-    sin su adjunto. Quien llama solo recibe el error, sin el id del borrador:
-    no podría retirarlo, y si repite crea otro. El DELETE sí se repite tras un
-    5xx, porque no duplica nada; si aun así falla, el error lleva el id para
-    retirarlo a mano.
+    Si falla la subida de un adjunto, el borrador queda creado, dirigido a
+    quien iba y sin él: la sesión de subida se repite tras un 5xx (graph.py),
+    pero puede no abrirse ni así, fallar un trozo o acabar sin crear el
+    adjunto. Quien llama solo recibe el error, sin el id del borrador: no
+    podría retirarlo, y si repite crea otro.
+
+    Retirar es moverlo a Elementos eliminados, de donde se recupera, como en
+    radon-api: un DELETE lo borraba sin pasar por ahí. Como allí queda, con su
+    destinatario y su asunto, el error lo dice. Mover le cambia el id, así que
+    se puede repetir tras un 5xx: si el primer intento ya lo había movido, el
+    siguiente da 404 con ErrorItemNotFound, y es que ya no está en Borradores.
+    Cualquier otro fallo, también un 404 con otro código, no dice que se haya
+    ido: el error lleva el id, para retirarlo a mano si sigue ahí.
     """
     try:
-        graph.request("DELETE", f"/me/messages/{message_id}", account_id)
+        graph.request(
+            "POST",
+            f"/me/messages/{message_id}/move",
+            account_id,
+            json={"destinationId": "deleteditems"},
+            repetible=True,
+        )
     except Exception as fallo:
-        raise RuntimeError(
+        if _ya_no_esta(fallo):
+            return RuntimeError(
+                f"{error}. El borrador a medias ya no está en Borradores"
+            )
+        return RuntimeError(
             f"{error}. Además, el borrador a medias {message_id} no se ha podido "
-            f"retirar ({fallo}): sigue en Borradores y hay que borrarlo a mano"
-        ) from fallo
+            f"retirar ({fallo}): si sigue en Borradores, hay que retirarlo a mano"
+        )
+    return RuntimeError(
+        f"{error}. El borrador a medias se ha movido a Elementos eliminados"
+    )
+
+
+def _ya_no_esta(fallo: Exception) -> bool:
+    """Si Graph dice que el mensaje ya no está: un 404 con ErrorItemNotFound, que
+    es lo que contesta por uno que se ha movido, porque mover le cambia el id.
+    Como `_ya_no_esta` de radon-api (conectores/graph_correo.py)."""
+    if not (
+        isinstance(fallo, httpx.HTTPStatusError) and fallo.response.status_code == 404
+    ):
+        return False
+    try:
+        codigo = fallo.response.json()["error"]["code"]
+    except (ValueError, LookupError, TypeError):
+        # sin cuerpo, o sin el error de Graph: no dice que se haya ido
+        return False
+    return codigo == "ErrorItemNotFound"
 
 
 @mcp.tool
@@ -305,8 +342,7 @@ def create_email_draft(
                 att.get("content_type", "application/octet-stream"),
             )
     except Exception as error:
-        _retirar_borrador_a_medias(message_id, account_id, error)
-        raise
+        raise _retirar_borrador_a_medias(message_id, account_id, error) from error
 
     return result
 
@@ -423,8 +459,7 @@ def send_email(
                         json=small_att,
                     )
         except Exception as error:
-            _retirar_borrador_a_medias(message_id, account_id, error)
-            raise
+            raise _retirar_borrador_a_medias(message_id, account_id, error) from error
 
         # Fuera del try: si el /send falla, Graph pudo mandarlo antes de
         # contestar. No se sabe si salió, y el borrador ya está completo, así
@@ -1023,37 +1058,63 @@ def unified_search(
 
 
 def _ensure_folder(account_id: str, drive_id: str, folder_path: str) -> None:
-    """Make sure every segment of folder_path exists in the drive, creating any
-    that are missing. Safe to call repeatedly (existing folders are left
-    untouched)."""
+    """Crea en el drive las carpetas de `folder_path` que falten.
+
+    La que ya existe se da por buena, también si aparece entre el GET que no la
+    encuentra y el POST que la crea: con dos subidas a la vez a una carpeta
+    nueva, las dos van a crearla, y con `conflictBehavior=fail` la segunda
+    recibe un 409. Por eso el POST se repite tras un 5xx: si Graph la creó antes
+    de fallar, la repetición da ese 409, y nunca quedan dos carpetas.
+
+    Un 409 solo dice que con ese nombre ya hay algo, así que se vuelve a leer.
+    Si es un fichero, y no una carpeta, la subida falla aquí y lo dice, en vez
+    de después, con el error de Graph al subir dentro. Cualquier otro error al
+    crearla la hace fallar también.
+    """
     parent = ""
     for segment in [s for s in folder_path.strip("/").split("/") if s]:
         current = f"{parent}/{segment}" if parent else segment
-        try:
-            existing = graph.request(
-                "GET", f"/drives/{drive_id}/root:/{current}", account_id
-            )
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code != 404:
-                raise
-            existing = None
-        if not existing:
+        existing = _elemento_del_drive(account_id, drive_id, current)
+        if existing is None:
             children_endpoint = (
                 "/drives/{drive}/root/children".format(drive=drive_id)
                 if not parent
                 else f"/drives/{drive_id}/root:/{parent}:/children"
             )
-            graph.request(
-                "POST",
-                children_endpoint,
-                account_id,
-                json={
-                    "name": segment,
-                    "folder": {},
-                    "@microsoft.graph.conflictBehavior": "fail",
-                },
+            try:
+                graph.request(
+                    "POST",
+                    children_endpoint,
+                    account_id,
+                    json={
+                        "name": segment,
+                        "folder": {},
+                        "@microsoft.graph.conflictBehavior": "fail",
+                    },
+                    repetible=True,
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 409:
+                    raise
+                existing = _elemento_del_drive(account_id, drive_id, current)
+        if existing is not None and "folder" not in existing:
+            raise ValueError(
+                f"en el drive, {current} es un fichero y no una carpeta: no se ha "
+                "subido nada"
             )
         parent = current
+
+
+def _elemento_del_drive(
+    account_id: str, drive_id: str, path: str
+) -> dict[str, Any] | None:
+    """El elemento del drive que hay en `path`, o None si no hay ninguno."""
+    try:
+        return graph.request("GET", f"/drives/{drive_id}/root:/{path}", account_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 404:
+            raise
+        return None
 
 
 @mcp.tool

@@ -270,7 +270,20 @@ create_event(
 - **Authentication fails**: Check your CLIENT_ID is correct
 - **"Need admin approval"**: Use `MICROSOFT_MCP_TENANT_ID=consumers` for personal accounts
 - **Missing permissions**: Ensure all required API permissions are granted in Azure
-- **Token errors**: Delete `~/.microsoft_mcp_token_cache.json` and re-authenticate
+- **«no hay sesión de Microsoft» o «Microsoft no renueva la sesión»**: la caché
+  no tiene sesión para esa cuenta, o Microsoft ya no la renueva (el motivo va
+  en el error). Se autoriza de nuevo con `authenticate.py`, que escribe en la
+  misma caché: no hace falta borrarla.
+- **«Microsoft no ha dado ahora el token»**: es pasajero, y la sesión sigue en
+  la caché. MSAL le pregunta a login.microsoftonline.com al crear la
+  aplicación, al buscar las cuentas y al renovar el token, y Microsoft no
+  contestó o contestó con un 5xx; o, al buscar las cuentas o al renovar, con
+  un 429. Se repite más tarde, sin autorizar nada.
+- **«Unable to get authority configuration for…»**: MSAL no ha podido leer la
+  configuración del tenant al crear la aplicación. Es un
+  `MICROSOFT_MCP_TENANT_ID` mal escrito, o un 429 de Microsoft al pedírsela,
+  que MSAL da con el mismo error y no se puede distinguir: si el tenant está
+  bien escrito, se repite más tarde.
 
 ## License
 

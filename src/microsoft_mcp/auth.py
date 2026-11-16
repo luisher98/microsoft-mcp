@@ -2,6 +2,7 @@ import os
 import sys
 import msal
 import pathlib as pl
+from msal.exceptions import MsalServiceError
 from typing import NamedTuple
 
 CACHE_FILE = pl.Path.home() / ".microsoft_mcp_token_cache.json"
@@ -12,6 +13,14 @@ SCOPES = ["https://graph.microsoft.com/.default"]
 # requests espera para siempre: una llamada sin sesión se colgaría hasta que el
 # cliente la cortara (radon-api, a los 120 s) en vez de fallar.
 TIMEOUT_MSAL = 15
+# Los errores de OAuth con que Microsoft dice que ahora no puede dar el token,
+# pero que lo dará: está ocupado o ha fallado él (RFC 6749 §4.1.2.1). Así le
+# llega a MSAL un 429 al renovar: como un error en la respuesta, no como una
+# excepción. Cualquier otro error al renovar es que la sesión ya no vale: un
+# refresh token caducado o revocado (invalid_grant), una política que pide
+# volver a entrar (interaction_required)... Son los mismos que separa radon-api
+# en conectores/graph.py.
+ERRORES_PASAJEROS = frozenset({"temporarily_unavailable", "server_error"})
 
 
 class Account(NamedTuple):
@@ -20,7 +29,8 @@ class Account(NamedTuple):
 
 
 class SinSesion(RuntimeError):
-    """La caché de tokens no tiene sesión para la cuenta: hay que autorizarla.
+    """La caché de tokens no tiene sesión para la cuenta, o Microsoft ya no la
+    renueva: hay que autorizarla.
 
     `get_token` no la pide con un device flow. En un servidor stdio, stdout es
     el canal del protocolo y nadie vería el código, así que la llamada se
@@ -30,11 +40,34 @@ class SinSesion(RuntimeError):
     """
 
 
-def _read_cache() -> str | None:
+class SinTokenPorAhora(RuntimeError):
+    """Microsoft no ha dado el token ahora, pero no es que falte la sesión: no
+    contestó, contestó con un 5xx o dijo que ahora no puede (un 429). Pasa
+    solo, y se repite más tarde sin autorizar nada. Qué lo da y qué no, en
+    `get_token`.
+
+    Antes era `SinSesion`, y su texto mandaba a autorizar de nuevo una sesión
+    que estaba bien.
+    """
+
+    def __init__(self, cuenta: str, motivo: str) -> None:
+        super().__init__(
+            f"microsoft-mcp: Microsoft no ha dado ahora el token de {cuenta} "
+            f"({motivo}): es pasajero, no falta la sesión; se repite más tarde, "
+            "sin autorizar nada"
+        )
+
+
+def _cache_del_disco() -> msal.SerializableTokenCache:
+    """La caché de tokens de `CACHE_FILE`; vacía, si aún no hay fichero."""
+    cache = msal.SerializableTokenCache()
     try:
-        return CACHE_FILE.read_text()
+        cache_content = CACHE_FILE.read_text()
     except FileNotFoundError:
-        return None
+        return cache
+    if cache_content:
+        cache.deserialize(cache_content)
+    return cache
 
 
 def _write_cache(content: str) -> None:
@@ -42,7 +75,9 @@ def _write_cache(content: str) -> None:
     CACHE_FILE.write_text(content)
 
 
-def get_app() -> msal.PublicClientApplication:
+def _aplicacion(cache: msal.SerializableTokenCache) -> msal.PublicClientApplication:
+    """La aplicación de MSAL sobre `cache`. Crearla ya le pide a
+    login.microsoftonline.com la configuración del tenant."""
     client_id = os.getenv("MICROSOFT_MCP_CLIENT_ID")
     if not client_id:
         raise ValueError("MICROSOFT_MCP_CLIENT_ID environment variable is required")
@@ -50,52 +85,87 @@ def get_app() -> msal.PublicClientApplication:
     tenant_id = os.getenv("MICROSOFT_MCP_TENANT_ID", "common")
     authority = f"https://login.microsoftonline.com/{tenant_id}"
 
-    cache = msal.SerializableTokenCache()
-    cache_content = _read_cache()
-    if cache_content:
-        cache.deserialize(cache_content)
-
-    app = msal.PublicClientApplication(
+    return msal.PublicClientApplication(
         client_id, authority=authority, token_cache=cache, timeout=TIMEOUT_MSAL
     )
 
-    return app
+
+def get_app() -> msal.PublicClientApplication:
+    return _aplicacion(_cache_del_disco())
 
 
 def get_token(account_id: str | None = None) -> str:
     """El token de la cuenta: el de la caché, o uno renovado sin preguntar a nadie.
 
-    Sin `account_id`, el de la primera cuenta de la caché. Si no hay sesión,
-    avisa por stderr y lanza `SinSesion`.
+    Sin `account_id`, el de la primera cuenta de la caché. Falla, avisando por
+    stderr, con:
+
+    - `SinSesion`, si la caché no tiene sesión para la cuenta, o si al
+      renovarla Microsoft dice que ya no vale (un refresh token caducado o
+      revocado, una política que pide volver a entrar...), con lo que dijo.
+    - `SinTokenPorAhora`, si Microsoft no contesta o contesta con un 5xx en
+      cualquiera de las tres veces que MSAL le pregunta: al crear la aplicación
+      (la configuración del tenant), al buscar las cuentas (los metadatos de
+      instancia) o al renovar el token. También con un 429 al buscar las
+      cuentas o al renovar, que al renovar llega como `temporarily_unavailable`.
+
+    Un 429 al pedir la configuración del tenant no es ninguno de los dos: MSAL
+    lo lanza como el ValueError de un tenant mal escrito («Unable to get
+    authority configuration for…»), y sale tal cual, porque no hay cómo
+    distinguirlos. Tampoco un fallo al leer la caché del disco, que es de esta
+    máquina y no de Microsoft.
     """
-    app = get_app()
+    cuenta = f"la cuenta {account_id or 'por defecto'}"
+    cache = _cache_del_disco()
+    try:
+        app = _aplicacion(cache)
+        accounts = app.get_accounts()
+        account = None
+        if account_id:
+            account = next(
+                (a for a in accounts if a["home_account_id"] == account_id), None
+            )
+        elif accounts:
+            account = accounts[0]
+        result = app.acquire_token_silent_with_error(SCOPES, account=account)
+    except (OSError, MsalServiceError) as e:
+        # Microsoft no contestó, o contestó con un 5xx (o un 429, al buscar las
+        # cuentas): las excepciones de `requests`, el transporte de MSAL, son
+        # OSError, y esas respuestas MSAL las lanza como MsalServiceError
+        error = SinTokenPorAhora(cuenta, f"{type(e).__name__}: {e}")
+        print(error, file=sys.stderr)
+        raise error from e
 
-    accounts = app.get_accounts()
-    account = None
+    if not result or "access_token" not in result:
+        error = _sin_token(cuenta, result)
+        print(error, file=sys.stderr)
+        raise error
 
-    if account_id:
-        account = next(
-            (a for a in accounts if a["home_account_id"] == account_id), None
-        )
-    elif accounts:
-        account = accounts[0]
-
-    result = app.acquire_token_silent(SCOPES, account=account)
-
-    if not result:
-        mensaje = (
-            f"microsoft-mcp: no hay sesión de Microsoft en {CACHE_FILE} para la "
-            f"cuenta {account_id or 'por defecto'}: hay que autorizar de nuevo; "
-            "un servidor stdio no puede pedir el código"
-        )
-        print(mensaje, file=sys.stderr)
-        raise SinSesion(mensaje)
-
-    cache = app.token_cache
-    if isinstance(cache, msal.SerializableTokenCache) and cache.has_state_changed:
+    if cache.has_state_changed:
         _write_cache(cache.serialize())
 
     return result["access_token"]
+
+
+def _sin_token(cuenta: str, result: dict | None) -> SinSesion | SinTokenPorAhora:
+    """Por qué MSAL no ha dado el token, según lo que ha devuelto: nada, si la
+    caché no tiene con qué pedirlo, o el error de Microsoft al renovarlo."""
+    if not result:
+        return SinSesion(
+            f"microsoft-mcp: no hay sesión de Microsoft en {CACHE_FILE} para "
+            f"{cuenta}: hay que autorizar de nuevo; un servidor stdio no puede "
+            "pedir el código"
+        )
+    # su código y su descripción (AADSTS…), tal cual los da Microsoft
+    partes = (result.get("error"), result.get("error_description"))
+    dice = ": ".join(str(p) for p in partes if p) or "sin más detalle"
+    if result.get("error") in ERRORES_PASAJEROS:
+        return SinTokenPorAhora(cuenta, dice)
+    return SinSesion(
+        f"microsoft-mcp: Microsoft no renueva la sesión de {CACHE_FILE} para "
+        f"{cuenta} ({dice}): hay que autorizar de nuevo; un servidor stdio no "
+        "puede pedir el código"
+    )
 
 
 def list_accounts() -> list[Account]:

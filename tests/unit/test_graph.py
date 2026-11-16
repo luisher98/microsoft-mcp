@@ -25,28 +25,44 @@ def test_un_get_que_da_503_se_reintenta_y_acaba_bien(graph_simulado):
 
 
 def test_un_post_que_da_502_no_se_repite(graph_simulado):
-    """La carpeta que crea `sharepoint_upload_file` cuando falta: Graph pudo
-    crearla antes de contestar el 502. El POST no se repite y el 502 sube a
-    quien llama."""
+    """El borrador que crea `create_email_draft`: Graph pudo crearlo antes de
+    contestar el 502, y repetirlo dejaría dos. El POST no se repite y el 502
+    sube a quien llama."""
     graph_simulado.respuestas = [httpx.Response(502)]
 
     with pytest.raises(httpx.HTTPStatusError) as error:
         graph.request(
-            "POST",
-            "/drives/drive-1/root/children",
-            "cuenta-1",
-            json={
-                "name": "informes",
-                "folder": {},
-                "@microsoft.graph.conflictBehavior": "fail",
-            },
+            "POST", "/me/messages", "cuenta-1", json={"subject": "Informe de radón"}
         )
 
     assert error.value.response.status_code == 502
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
-        ("POST", "/v1.0/drives/drive-1/root/children"),
+        ("POST", "/v1.0/me/messages"),
     ]
     assert graph_simulado.esperas == []
+
+
+def test_un_post_repetible_se_repite_tras_un_5xx(graph_simulado):
+    """El que quien llama marca como repetible porque no deja dos de nada, como
+    abrir una sesión de subida, se repite como un método idempotente."""
+    graph_simulado.respuestas = [
+        httpx.Response(503),
+        httpx.Response(200, json={"uploadUrl": "https://subida.example.com/sesion-1"}),
+    ]
+
+    resultado = graph.request(
+        "POST",
+        "/drives/drive-1/root:/it/9187497.pdf:/createUploadSession",
+        "cuenta-1",
+        json={"item": {}},
+        repetible=True,
+    )
+
+    assert resultado == {"uploadUrl": "https://subida.example.com/sesion-1"}
+    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
+        ("POST", "/v1.0/drives/drive-1/root:/it/9187497.pdf:/createUploadSession"),
+    ] * 2
+    assert graph_simulado.esperas == [1]
 
 
 @pytest.mark.parametrize("corte", [httpx.ReadTimeout, httpx.RemoteProtocolError])

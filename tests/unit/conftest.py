@@ -52,7 +52,7 @@ class AplicacionSinSesion:
     def get_accounts(self) -> list[dict[str, str]]:
         return []
 
-    def acquire_token_silent(
+    def acquire_token_silent_with_error(
         self, scopes: list[str], account: dict[str, str] | None
     ) -> None:
         return None

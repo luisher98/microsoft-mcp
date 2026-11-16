@@ -6,10 +6,12 @@ nadie vería el código.
 
 import msal
 import pytest
+import requests
+from msal.exceptions import MsalServiceError
 
-from microsoft_mcp import auth
+from microsoft_mcp import auth, graph
 
-from .conftest import AplicacionSinSesion
+from .conftest import AplicacionSinSesion, llamar_por_mcp
 
 CUENTA = {"home_account_id": "cuenta-1", "username": "info@example.com"}
 TOKEN_VIGENTE = "token-vigente"
@@ -27,7 +29,7 @@ class AplicacionConSesion(AplicacionSinSesion):
     def get_accounts(self) -> list[dict[str, str]]:
         return [CUENTA]
 
-    def acquire_token_silent(
+    def acquire_token_silent_with_error(
         self, scopes: list[str], account: dict[str, str] | None
     ) -> dict[str, str] | None:
         if account is None:
@@ -39,7 +41,7 @@ class AplicacionQueRenuevaElToken(AplicacionConSesion):
     """El token de `CUENTA` había caducado: MSAL lo renueva con el refresh token
     y apunta los tokens nuevos en la caché, como en un refresco de verdad."""
 
-    def acquire_token_silent(
+    def acquire_token_silent_with_error(
         self, scopes: list[str], account: dict[str, str] | None
     ) -> dict[str, str] | None:
         if account is None:
@@ -57,6 +59,33 @@ class AplicacionQueRenuevaElToken(AplicacionConSesion):
             }
         )
         return {"access_token": TOKEN_RENOVADO}
+
+
+def aplicacion_que_no_renueva(
+    fallo: dict[str, str] | Exception,
+) -> type[AplicacionConSesion]:
+    """Una caché con `CUENTA`, cuyo token había caducado, y Microsoft que no lo
+    renueva: MSAL devuelve `fallo`, el error de Microsoft, o lo lanza, si es
+    una excepción, como cuando Microsoft no contesta."""
+
+    class AplicacionQueNoRenueva(AplicacionConSesion):
+        def acquire_token_silent_with_error(
+            self, scopes: list[str], account: dict[str, str] | None
+        ) -> dict[str, str] | None:
+            if account is None:
+                return None
+            if isinstance(fallo, Exception):
+                raise fallo
+            return fallo
+
+    return AplicacionQueNoRenueva
+
+
+# Lo que dice Microsoft al renovar cuando ahora no puede dar el token
+AHORA_NO_PUEDE = {
+    "error": "temporarily_unavailable",
+    "error_description": "The server is temporarily unable to handle the request",
+}
 
 
 def refresh_tokens_guardados() -> list[str] | None:
@@ -107,6 +136,216 @@ def test_una_cuenta_que_no_esta_en_la_cache_es_sin_sesion(monkeypatch):
         auth.get_token("cuenta-2")
 
     assert AplicacionSinSesion.device_flows_pedidos == []
+
+
+@pytest.mark.parametrize(
+    ("fallo", "motivo"),
+    [
+        pytest.param(
+            AHORA_NO_PUEDE,
+            "temporarily_unavailable: The server is temporarily unable to handle "
+            "the request",
+            id="un-429",
+        ),
+        pytest.param(
+            {"error": "server_error", "error_description": "Unexpected error"},
+            "server_error: Unexpected error",
+            id="server_error",
+        ),
+        pytest.param(
+            # como lo lanza la MSAL que pide pyproject.toml (su
+            # throttled_http_client.py); la 1.32.3 lo construía mal, y lo que
+            # salía era un KeyError('error')
+            MsalServiceError("HTTP Error: 503", error=None, error_description=None),
+            "MsalServiceError: HTTP Error: 503",
+            id="un-5xx",
+        ),
+        pytest.param(
+            requests.exceptions.ConnectTimeout("login.microsoftonline.com"),
+            "ConnectTimeout: login.microsoftonline.com",
+            id="sin-respuesta",
+        ),
+    ],
+)
+def test_si_microsoft_no_da_el_token_ahora_es_pasajero_y_no_sin_sesion(
+    monkeypatch, capsys, fallo, motivo
+):
+    """Un 429 al renovar llega a MSAL como un error en la respuesta; un 5xx o
+    una red que no contesta, como una excepción. Con `acquire_token_silent`, el
+    429 era None, lo mismo que una caché vacía, y salía como `SinSesion`, que
+    manda a autorizar de nuevo una sesión que está bien. Es pasajero: se dice
+    lo que pasó, que se repite más tarde, y la caché no se toca."""
+    monkeypatch.setattr(
+        msal, "PublicClientApplication", aplicacion_que_no_renueva(fallo)
+    )
+
+    with pytest.raises(auth.SinTokenPorAhora) as error:
+        auth.get_token("cuenta-1")
+
+    mensaje = str(error.value)
+    assert mensaje == (
+        "microsoft-mcp: Microsoft no ha dado ahora el token de la cuenta "
+        f"cuenta-1 ({motivo}): es pasajero, no falta la sesión; se repite más "
+        "tarde, sin autorizar nada"
+    )
+    salida = capsys.readouterr()
+    assert salida.out == ""
+    assert salida.err == f"{mensaje}\n"
+    assert refresh_tokens_guardados() is None
+
+
+@pytest.mark.parametrize(
+    "fallo",
+    [
+        pytest.param(
+            {
+                "error": "invalid_grant",
+                "error_description": "AADSTS700082: The refresh token has expired "
+                "due to inactivity.",
+            },
+            id="refresh-token-caducado",
+        ),
+        pytest.param(
+            {
+                "error": "interaction_required",
+                "error_description": "AADSTS50076: you must use multi-factor "
+                "authentication.",
+            },
+            id="hay-que-volver-a-entrar",
+        ),
+    ],
+)
+def test_si_microsoft_no_renueva_la_sesion_es_sin_sesion_y_dice_por_que(
+    monkeypatch, fallo
+):
+    """Un refresh token caducado o revocado, o una política que pide volver a
+    entrar, no pasan solos: es `SinSesion`, con lo que dijo Microsoft, que con
+    `acquire_token_silent` se perdía."""
+    monkeypatch.setattr(
+        msal, "PublicClientApplication", aplicacion_que_no_renueva(fallo)
+    )
+
+    with pytest.raises(auth.SinSesion) as error:
+        auth.get_token("cuenta-1")
+
+    assert str(error.value) == (
+        f"microsoft-mcp: Microsoft no renueva la sesión de {auth.CACHE_FILE} para "
+        f"la cuenta cuenta-1 ({fallo['error']}: {fallo['error_description']}): hay "
+        "que autorizar de nuevo; un servidor stdio no puede pedir el código"
+    )
+    assert AplicacionSinSesion.device_flows_pedidos == []
+
+
+def aplicacion_sin_microsoft(paso: str, fallo: Exception) -> type[AplicacionConSesion]:
+    """Una caché con `CUENTA`, y Microsoft que falla antes de que haga falta
+    renovar nada: al crear la aplicación, cuando MSAL le pide la configuración
+    del tenant, o al buscar las cuentas, cuando le pide los metadatos de
+    instancia. MSAL lanza `fallo`."""
+
+    class AplicacionSinMicrosoft(AplicacionConSesion):
+        def __init__(
+            self,
+            client_id: str,
+            authority: str,
+            token_cache: msal.SerializableTokenCache,
+            timeout: float,
+        ) -> None:
+            if paso == "al-crearla":
+                raise fallo
+            super().__init__(client_id, authority, token_cache, timeout)
+
+        def get_accounts(self) -> list[dict[str, str]]:
+            if paso == "al-buscar-las-cuentas":
+                raise fallo
+            return super().get_accounts()
+
+    return AplicacionSinMicrosoft
+
+
+@pytest.mark.parametrize(
+    ("fallo", "motivo"),
+    [
+        pytest.param(
+            # como lo lanza MSAL, también con un 429 al buscar las cuentas
+            MsalServiceError("HTTP Error: 503", error=None, error_description=None),
+            "MsalServiceError: HTTP Error: 503",
+            id="un-5xx",
+        ),
+        pytest.param(
+            requests.exceptions.ConnectTimeout("login.microsoftonline.com"),
+            "ConnectTimeout: login.microsoftonline.com",
+            id="sin-respuesta",
+        ),
+    ],
+)
+@pytest.mark.parametrize("paso", ["al-crearla", "al-buscar-las-cuentas"])
+def test_si_microsoft_falla_antes_de_renovar_tambien_es_pasajero(
+    monkeypatch, capsys, paso, fallo, motivo
+):
+    """MSAL no solo habla con login.microsoftonline.com al renovar el token: al
+    crear la aplicación le pide la configuración del tenant, y al buscar las
+    cuentas, los metadatos de instancia. Como cada `get_token` crea la
+    aplicación, eso pasa más a menudo que renovar. Un 5xx o una red que no
+    contesta ahí salían tal cual, como `MsalServiceError: HTTP Error: 503` o
+    `ConnectTimeout`, sin decir que eran pasajeros."""
+    monkeypatch.setattr(
+        msal, "PublicClientApplication", aplicacion_sin_microsoft(paso, fallo)
+    )
+
+    with pytest.raises(auth.SinTokenPorAhora) as error:
+        auth.get_token("cuenta-1")
+
+    mensaje = str(error.value)
+    assert mensaje == (
+        "microsoft-mcp: Microsoft no ha dado ahora el token de la cuenta "
+        f"cuenta-1 ({motivo}): es pasajero, no falta la sesión; se repite más "
+        "tarde, sin autorizar nada"
+    )
+    salida = capsys.readouterr()
+    assert salida.out == ""
+    assert salida.err == f"{mensaje}\n"
+    assert refresh_tokens_guardados() is None
+
+
+def test_si_no_se_puede_leer_la_cache_no_es_cosa_de_microsoft():
+    """La caché es un fichero de esta máquina. Si no se puede leer, el error
+    sale tal cual, y no como si Microsoft no hubiera contestado: eso mandaría a
+    esperar algo que no se arregla solo."""
+    auth.CACHE_FILE.mkdir()
+
+    with pytest.raises(IsADirectoryError):
+        auth.get_token("cuenta-1")
+
+
+def test_por_mcp_el_fallo_pasajero_llega_sin_mandar_a_autorizar(
+    monkeypatch, graph_simulado, tmp_path
+):
+    """Lo que ve radon-api: `mcp_cliente.llamar_herramienta` lanza un McpError
+    con este texto, y su worker lo reintenta como un fallo técnico (MCP_ERROR).
+    Ya no le dice a nadie que autorice de nuevo, y no ha salido nada hacia
+    Graph."""
+    monkeypatch.setattr(graph, "get_token", auth.get_token)
+    monkeypatch.setattr(
+        msal, "PublicClientApplication", aplicacion_que_no_renueva(AHORA_NO_PUEDE)
+    )
+    informe = tmp_path / "9187497.pdf"
+    informe.write_bytes(b"%PDF-1.7\n")
+
+    error = llamar_por_mcp(
+        "sharepoint_upload_file",
+        {
+            "account_id": "cuenta-1",
+            "drive_id": "drive-1",
+            "local_file_path": str(informe),
+            "target_path": "it/9187497.pdf",
+        },
+    )
+
+    assert error is not None
+    assert "Microsoft no ha dado ahora el token de la cuenta cuenta-1" in error
+    assert "es pasajero" in error
+    assert "hay que autorizar" not in error
+    assert graph_simulado.peticiones == []
 
 
 def test_msal_no_espera_sin_limite_a_microsoft():
