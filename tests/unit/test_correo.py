@@ -142,6 +142,11 @@ def test_send_email_manda_el_cuerpo_en_html_si_se_le_pide(
     }
 
 
+ABRIR_SESION_M1 = ("POST", "/v1.0/me/messages/m1/attachments/createUploadSession")
+# Retirar un borrador es moverlo a Elementos eliminados
+MOVER_M1 = ("POST", "/v1.0/me/messages/m1/move")
+A_ELIMINADOS = {"destinationId": "deleteditems"}
+
 CON_UN_ADJUNTO_GRANDE = pytest.mark.parametrize(
     ("herramienta", "argumentos"),
     [
@@ -151,18 +156,25 @@ CON_UN_ADJUNTO_GRANDE = pytest.mark.parametrize(
 )
 
 
+def sesion_que_no_se_abre() -> list[httpx.Response]:
+    """La subida del adjunto que falla: la sesión sigue dando un 502 tras sus tres
+    reintentos, tras 1, 2 y 4 s."""
+    return [httpx.Response(502) for _ in range(4)]
+
+
 @CON_UN_ADJUNTO_GRANDE
 def test_si_falla_la_subida_de_un_adjunto_grande_el_borrador_se_retira(
     graph_simulado, tmp_path, herramienta, argumentos
 ):
-    """La sesión de subida es un POST y no se repite tras un 502. El borrador ya
-    estaba creado, dirigido a quien iba y sin el adjunto, y quien llama no sabe
-    su id: no podría retirarlo y, si repite, crearía otro. Se retira y el 502
-    llega a radon-api tal cual."""
+    """Si la sesión de subida del adjunto no se abre, el borrador ya estaba
+    creado, dirigido a quien iba y sin el adjunto, y quien llama no sabe su id:
+    no podría retirarlo y, si repite, crearía otro. Se retira a Elementos
+    eliminados, de donde se recupera, y el 502 llega a radon-api tal cual. Antes
+    se borraba con un DELETE, sin pasar por ahí."""
     graph_simulado.respuestas = [
         httpx.Response(201, json={"id": "m1"}),
-        httpx.Response(502),
-        httpx.Response(204),
+        *sesion_que_no_se_abre(),
+        httpx.Response(201, json={"id": "m1-en-eliminados"}),
     ]
 
     error = llamar_por_mcp(herramienta, argumentos(pdf(tmp_path, TRES_MIB + 1)))
@@ -171,21 +183,52 @@ def test_si_falla_la_subida_de_un_adjunto_grande_el_borrador_se_retira(
     assert "502 Bad Gateway" in error
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "/v1.0/me/messages"),
-        ("POST", "/v1.0/me/messages/m1/attachments/createUploadSession"),
-        ("DELETE", "/v1.0/me/messages/m1"),
+        *[ABRIR_SESION_M1] * 4,
+        MOVER_M1,
     ]
-    assert graph_simulado.esperas == []
+    assert json.loads(graph_simulado.peticiones[-1].content) == A_ELIMINADOS
+    assert graph_simulado.esperas == [1, 2, 4]
+
+
+@CON_UN_ADJUNTO_GRANDE
+def test_si_el_borrador_ya_se_movio_el_404_es_que_esta_retirado(
+    graph_simulado, tmp_path, herramienta, argumentos
+):
+    """Mover se repite tras un 5xx: le cambia el id al mensaje, así que
+    repetirlo no lo mueve dos veces ni toca otro. Si Graph lo movió antes de
+    contestar el 503, el siguiente intento da 404, y es que ya no está en
+    Borradores: el error es solo el 502 de la subida."""
+    graph_simulado.respuestas = [
+        httpx.Response(201, json={"id": "m1"}),
+        *sesion_que_no_se_abre(),
+        httpx.Response(503),
+        httpx.Response(404, json={"error": {"code": "ErrorItemNotFound"}}),
+    ]
+
+    error = llamar_por_mcp(herramienta, argumentos(pdf(tmp_path, TRES_MIB + 1)))
+
+    assert error is not None
+    assert "502 Bad Gateway" in error
+    assert "no se ha podido retirar" not in error
+    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
+        ("POST", "/v1.0/me/messages"),
+        *[ABRIR_SESION_M1] * 4,
+        MOVER_M1,
+        MOVER_M1,
+    ]
+    assert graph_simulado.esperas == [1, 2, 4, 1]
 
 
 @CON_UN_ADJUNTO_GRANDE
 def test_si_tampoco_se_puede_retirar_el_borrador_el_error_dice_cual_es(
     graph_simulado, tmp_path, herramienta, argumentos
 ):
-    """El DELETE sí se repite tras un 5xx, porque no duplica nada. Si Graph sigue
-    sin contestar, el error dice qué borrador ha quedado, para retirarlo a mano."""
+    """Si al moverlo Graph sigue con un 503 tras tres reintentos, el error dice
+    qué borrador ha quedado, para retirarlo a mano. Puede que alguno de esos
+    503 sí lo moviera, así que no da por hecho que siga en Borradores."""
     graph_simulado.respuestas = [
         httpx.Response(201, json={"id": "m1"}),
-        httpx.Response(502),
+        *sesion_que_no_se_abre(),
         *[httpx.Response(503) for _ in range(4)],
     ]
 
@@ -193,14 +236,44 @@ def test_si_tampoco_se_puede_retirar_el_borrador_el_error_dice_cual_es(
 
     assert error is not None
     assert "502 Bad Gateway" in error
-    assert "el borrador a medias m1 no se ha podido retirar" in error
-    assert "hay que borrarlo a mano" in error
+    assert (
+        "el borrador a medias m1 no se ha podido retirar (Server error '503 Service "
+        "Unavailable'" in error
+    )
+    assert "si sigue en Borradores, hay que retirarlo a mano" in error
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "/v1.0/me/messages"),
-        ("POST", "/v1.0/me/messages/m1/attachments/createUploadSession"),
-        *[("DELETE", "/v1.0/me/messages/m1")] * 4,
+        *[ABRIR_SESION_M1] * 4,
+        *[MOVER_M1] * 4,
     ]
-    assert graph_simulado.esperas == [1, 2, 4]
+    assert graph_simulado.esperas == [1, 2, 4, 1, 2, 4]
+
+
+def test_si_abrir_la_sesion_de_un_adjunto_da_un_5xx_se_repite(
+    graph_simulado, tmp_path
+):
+    """Como la de un fichero del drive: abrirla no crea el adjunto, que solo
+    existe cuando la sesión recibe el último trozo, así que repetirla tras un
+    503 deja como mucho una sesión vacía, nunca dos adjuntos. Antes el 503
+    dejaba el borrador a medias, y había que retirarlo."""
+    graph_simulado.respuestas = [
+        httpx.Response(201, json={"id": "m1"}),
+        httpx.Response(503),
+        httpx.Response(201, json={"uploadUrl": "https://subida.example.com/sesion-1"}),
+        httpx.Response(201, json={}),
+    ]
+
+    assert (
+        llamar_por_mcp("create_email_draft", borrador(pdf(tmp_path, TRES_MIB + 1)))
+        is None
+    )
+    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
+        ("POST", "/v1.0/me/messages"),
+        ABRIR_SESION_M1,
+        ABRIR_SESION_M1,
+        ("PUT", "/sesion-1"),
+    ]
+    assert graph_simulado.esperas == [1]
 
 
 def test_un_borrador_con_un_adjunto_grande_que_sube_bien_se_queda(

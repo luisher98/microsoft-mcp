@@ -215,19 +215,36 @@ def _retirar_borrador_a_medias(
 ) -> None:
     """Retira el borrador que `error` ha dejado a medias, antes de que el error suba.
 
-    Un POST que Graph contesta con un 5xx no se repite (graph.py), así que una
-    sesión de subida que falla deja el borrador creado, dirigido a quien iba y
-    sin su adjunto. Quien llama solo recibe el error, sin el id del borrador:
-    no podría retirarlo, y si repite crea otro. El DELETE sí se repite tras un
-    5xx, porque no duplica nada; si aun así falla, el error lleva el id para
-    retirarlo a mano.
+    Si falla la subida de un adjunto, el borrador queda creado, dirigido a
+    quien iba y sin él: la sesión de subida se repite tras un 5xx (graph.py),
+    pero puede no abrirse ni así, o fallar un trozo. Quien llama solo recibe el
+    error, sin el id del borrador: no podría retirarlo, y si repite crea otro.
+
+    Retirar es moverlo a Elementos eliminados, de donde se recupera, como en
+    radon-api: un DELETE lo borraba sin pasar por ahí. Mover le cambia el id,
+    así que se puede repetir tras un 5xx: si el primer intento ya lo había
+    movido, el siguiente da 404, y es que ya no está en Borradores. Si aun así
+    falla, el error lleva el id para retirarlo a mano.
     """
     try:
-        graph.request("DELETE", f"/me/messages/{message_id}", account_id)
+        graph.request(
+            "POST",
+            f"/me/messages/{message_id}/move",
+            account_id,
+            json={"destinationId": "deleteditems"},
+            repetible=True,
+        )
     except Exception as fallo:
+        if (
+            isinstance(fallo, httpx.HTTPStatusError)
+            and fallo.response.status_code == 404
+        ):
+            # ya no está con ese id: lo movió un intento que Graph contestó con
+            # un 5xx
+            return
         raise RuntimeError(
             f"{error}. Además, el borrador a medias {message_id} no se ha podido "
-            f"retirar ({fallo}): sigue en Borradores y hay que borrarlo a mano"
+            f"retirar ({fallo}): si sigue en Borradores, hay que retirarlo a mano"
         ) from fallo
 
 

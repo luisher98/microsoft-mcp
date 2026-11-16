@@ -273,12 +273,19 @@ def create_mail_upload_session(
     attachment_item: dict[str, Any],
     account_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create an upload session for large mail attachments"""
+    """Abre una sesión de subida para un adjunto grande de un mensaje.
+
+    Se repite tras un 5xx, como la de un fichero del drive
+    (`create_upload_session`): abrirla no crea el adjunto, que solo existe
+    cuando la sesión recibe el último trozo. Repetirla deja como mucho alguna
+    sesión vacía, nunca dos adjuntos.
+    """
     result = request(
         "POST",
         f"/me/messages/{message_id}/attachments/createUploadSession",
         account_id,
         json={"AttachmentItem": attachment_item},
+        repetible=True,
     )
     if not result:
         raise ValueError("Failed to create mail attachment upload session")
