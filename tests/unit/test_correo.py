@@ -8,11 +8,19 @@ from typing import Any
 import httpx
 import pytest
 
+from microsoft_mcp import graph
+
 from .conftest import llamar_por_mcp
 
 # Desde aquí, un adjunto no va dentro del POST: el mensaje se crea como borrador
 # y el adjunto se sube después, con una sesión de subida (tools.py).
 TRES_MIB = 3 * 1024 * 1024
+# La sesión de subida de un adjunto, que es de Outlook y no de Graph: contesta
+# 200 a cada trozo mientras le falta alguno, y 201, sin cuerpo, cuando ya tiene
+# el adjunto entero y lo crea. Así lo documenta Graph y así lo simula radon-api
+# (tests/conftest.py, `_tramo`)
+SESION = "https://subida.example.com/sesion-1"
+TROZO_M1 = ("PUT", "/sesion-1")
 
 # Los argumentos de `enviar_interno` (radon-api, conectores/correo.py): el aviso
 # interno del RF-38, tres enlaces en HTML y sin adjuntos. `account_id` lo pone
@@ -75,10 +83,8 @@ def impresion(adjunto: str) -> dict[str, Any]:
             TRES_MIB + 1,
             [
                 httpx.Response(201, json={"id": "m1"}),
-                httpx.Response(
-                    201, json={"uploadUrl": "https://subida.example.com/sesion-1"}
-                ),
-                httpx.Response(201, json={}),
+                httpx.Response(201, json={"uploadUrl": SESION}),
+                httpx.Response(201),
                 httpx.Response(502),
             ],
             [
@@ -259,8 +265,8 @@ def test_si_abrir_la_sesion_de_un_adjunto_da_un_5xx_se_repite(
     graph_simulado.respuestas = [
         httpx.Response(201, json={"id": "m1"}),
         httpx.Response(503),
-        httpx.Response(201, json={"uploadUrl": "https://subida.example.com/sesion-1"}),
-        httpx.Response(201, json={}),
+        httpx.Response(201, json={"uploadUrl": SESION}),
+        httpx.Response(201),
     ]
 
     assert (
@@ -271,7 +277,7 @@ def test_si_abrir_la_sesion_de_un_adjunto_da_un_5xx_se_repite(
         ("POST", "/v1.0/me/messages"),
         ABRIR_SESION_M1,
         ABRIR_SESION_M1,
-        ("PUT", "/sesion-1"),
+        TROZO_M1,
     ]
     assert graph_simulado.esperas == [1]
 
@@ -280,11 +286,16 @@ def test_un_borrador_con_un_adjunto_grande_que_sube_bien_se_queda(
     graph_simulado, tmp_path
 ):
     """Retirarlo es solo para cuando algo falla: si el adjunto sube, el borrador
-    queda en Borradores con él."""
+    queda en Borradores con él. Un PDF de 3 MiB a 3,75 MiB va en un solo trozo,
+    y Outlook lo da por creado con un 201 sin cuerpo; antes se leía como JSON,
+    fallaba, y el borrador, ya completo, se retiraba.
+
+    El trozo va sin el token de Graph: la `uploadUrl` ya lleva su credencial,
+    y es de Outlook, no de Graph."""
     graph_simulado.respuestas = [
         httpx.Response(201, json={"id": "m1"}),
-        httpx.Response(201, json={"uploadUrl": "https://subida.example.com/sesion-1"}),
-        httpx.Response(201, json={}),
+        httpx.Response(201, json={"uploadUrl": SESION}),
+        httpx.Response(201),
     ]
 
     assert (
@@ -300,3 +311,66 @@ def test_un_borrador_con_un_adjunto_grande_que_sube_bien_se_queda(
         ),
         ("PUT", "subida.example.com", "/sesion-1"),
     ]
+    trozo = graph_simulado.peticiones[-1]
+    assert trozo.headers["Content-Range"] == f"bytes 0-{TRES_MIB}/{TRES_MIB + 1}"
+    assert "Authorization" not in trozo.headers
+
+
+def test_la_impresora_manda_un_pdf_que_va_en_varios_trozos(graph_simulado, tmp_path):
+    """Un PDF de más de 3,75 MiB va en trozos de 12 × 320 KiB, por debajo de los
+    4 MB que admite Outlook por petición; antes iban de 4,9 MB. Outlook contesta
+    200 al primero, porque le falta el resto, y antes ese 200 daba el adjunto
+    por subido y el correo salía sin él. Ahora se manda el segundo, el 201 crea
+    el adjunto, y solo entonces sale el correo."""
+    trozo = graph.TROZO_DE_ADJUNTO
+    total = trozo + 1
+    graph_simulado.respuestas = [
+        httpx.Response(201, json={"id": "m1"}),
+        httpx.Response(201, json={"uploadUrl": SESION}),
+        httpx.Response(200, json={"nextExpectedRanges": [f"{trozo}-"]}),
+        httpx.Response(201),
+        httpx.Response(202),
+    ]
+
+    assert llamar_por_mcp("send_email", impresion(pdf(tmp_path, total))) is None
+    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
+        ("POST", "/v1.0/me/messages"),
+        ABRIR_SESION_M1,
+        TROZO_M1,
+        TROZO_M1,
+        ("POST", "/v1.0/me/messages/m1/send"),
+    ]
+    trozos = [p for p in graph_simulado.peticiones if (p.method, p.url.path) == TROZO_M1]
+    assert [(p.headers["Content-Range"], len(p.content)) for p in trozos] == [
+        (f"bytes 0-{trozo - 1}/{total}", trozo),
+        (f"bytes {trozo}-{trozo}/{total}", 1),
+    ]
+    assert trozo < 4_000_000
+    assert all("Authorization" not in p.headers for p in trozos)
+
+
+@CON_UN_ADJUNTO_GRANDE
+def test_si_la_sesion_no_crea_el_adjunto_el_borrador_se_retira(
+    graph_simulado, tmp_path, herramienta, argumentos
+):
+    """Outlook contesta al último trozo con un 200 y lo que le falta, en vez de
+    con el 201 que crea el adjunto: el adjunto no existe. El borrador se retira
+    como cuando la sesión no se abre, y el correo de la impresora no sale."""
+    graph_simulado.respuestas = [
+        httpx.Response(201, json={"id": "m1"}),
+        httpx.Response(201, json={"uploadUrl": SESION}),
+        httpx.Response(200, json={"nextExpectedRanges": ["0-"]}),
+        httpx.Response(201, json={"id": "m1-en-eliminados"}),
+    ]
+
+    error = llamar_por_mcp(herramienta, argumentos(pdf(tmp_path, TRES_MIB + 1)))
+
+    assert error is not None
+    assert "sin crear el adjunto: no se ha adjuntado" in error
+    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
+        ("POST", "/v1.0/me/messages"),
+        ABRIR_SESION_M1,
+        TROZO_M1,
+        MOVER_M1,
+    ]
+    assert json.loads(graph_simulado.peticiones[-1].content) == A_ELIMINADOS

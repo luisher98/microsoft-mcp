@@ -79,7 +79,8 @@ def test_si_abrir_la_sesion_de_subida_da_un_5xx_se_repite(graph_simulado, tmp_pa
     informe no subía.
 
     Un trozo que da un 5xx se repite con el mismo tramo; aquí Graph no lo
-    tenía, y lo recibe al repetirlo."""
+    tenía, y lo recibe al repetirlo. Los trozos van sin el token de Graph: la
+    `uploadUrl` ya lleva su credencial, y con el token puede contestar 401."""
     graph_simulado.respuestas = [
         httpx.Response(200, json=CARPETA_IT),
         httpx.Response(503),
@@ -104,6 +105,11 @@ def test_si_abrir_la_sesion_de_subida_da_un_5xx_se_repite(graph_simulado, tmp_pa
         f"bytes 0-{TROZO_MAXIMO - 1}/{TROZO_MAXIMO + 1}",
         f"bytes {TROZO_MAXIMO}-{TROZO_MAXIMO}/{TROZO_MAXIMO + 1}",
     ]
+    assert all(
+        "Authorization" not in p.headers
+        for p in graph_simulado.peticiones
+        if p.url.path == TROZO[1]
+    )
     assert graph_simulado.esperas == [1, 1]
 
 

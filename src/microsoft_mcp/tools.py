@@ -217,8 +217,9 @@ def _retirar_borrador_a_medias(
 
     Si falla la subida de un adjunto, el borrador queda creado, dirigido a
     quien iba y sin él: la sesión de subida se repite tras un 5xx (graph.py),
-    pero puede no abrirse ni así, o fallar un trozo. Quien llama solo recibe el
-    error, sin el id del borrador: no podría retirarlo, y si repite crea otro.
+    pero puede no abrirse ni así, fallar un trozo o acabar sin crear el
+    adjunto. Quien llama solo recibe el error, sin el id del borrador: no
+    podría retirarlo, y si repite crea otro.
 
     Retirar es moverlo a Elementos eliminados, de donde se recupera, como en
     radon-api: un DELETE lo borraba sin pasar por ahí. Mover le cambia el id,

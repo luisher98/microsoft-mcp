@@ -4,8 +4,11 @@ from typing import Any, Iterator
 from .auth import get_token
 
 BASE_URL = "https://graph.microsoft.com/v1.0"
-# 15 x 320 KiB = 4,915,200 bytes
+# Los trozos de una subida al drive: 15 x 320 KiB = 4,915,200 bytes
 UPLOAD_CHUNK_SIZE = 15 * 320 * 1024
+# Los de un adjunto de correo, por debajo de los 4 MB que admite Outlook por
+# petición y en múltiplos de 320 KiB, como en radon-api (conectores/graph_correo.py)
+TROZO_DE_ADJUNTO = 12 * 320 * 1024
 # Los que se pueden repetir sin duplicar nada. HTTP no promete que PATCH lo sea,
 # pero en Graph fija las propiedades que lleva: dos veces dejan lo mismo que una.
 METODOS_IDEMPOTENTES = frozenset({"GET", "HEAD", "PUT", "PATCH", "DELETE"})
@@ -159,36 +162,34 @@ def download_raw(
     raise ValueError("Failed to download file after all retries")
 
 
-def _do_chunked_upload(
-    upload_url: str,
-    data: bytes,
-    headers: dict[str, str],
-) -> dict[str, Any]:
-    """Sube `data` por trozos a una sesión de subida y devuelve lo que creó Graph:
-    el fichero del drive, o el adjunto del correo.
+def _do_chunked_upload(upload_url: str, data: bytes, trozo: int) -> httpx.Response:
+    """Sube `data` en trozos de `trozo` bytes a la `uploadUrl` de una sesión de
+    subida, y devuelve la respuesta al último. Qué dice esa respuesta depende de
+    la sesión, y lo mira quien la abrió: la del drive da el fichero con un 200 o
+    un 201, y la de un adjunto, que es de Outlook, lo crea con un 201 sin cuerpo.
 
-    Solo un trozo que contesta 200 o 201 da por subido lo que se sube. Un trozo
-    se repite tras un 429 o un 5xx, con los mismos bytes al mismo tramo, así
-    que nada se escribe dos veces: si Graph lo había recibido antes de fallar,
-    contesta 416, y la subida acaba en ese error, sin el fichero. Un corte de
-    la conexión no se repite, como en `request`. La sesión que queda a medias
-    la descarta Microsoft cuando caduca.
+    Los trozos van sin el token de Graph, como pide su documentación: la
+    `uploadUrl` ya lleva su credencial, y en el drive el token puede dar un 401.
+    Un trozo se repite tras un 429 o un 5xx, con los mismos bytes al mismo
+    tramo, así que nada se escribe fuera de su sitio: si el drive lo había
+    recibido antes de fallar, contesta 416, y la subida acaba en ese error. Un
+    corte de la conexión no se repite, como en `request`. La sesión que queda a
+    medias la descarta Microsoft cuando caduca.
 
     Que la subida falle no siempre es que no se haya subido: tras un 5xx en el
-    último trozo, no se sabe si Graph llegó a crear el fichero antes de fallar.
+    último trozo, no se sabe si la sesión llegó a crear lo que subía.
     """
     file_size = len(data)
 
-    for i in range(0, file_size, UPLOAD_CHUNK_SIZE):
+    for i in range(0, file_size, trozo):
         chunk_start = i
-        chunk_end = min(i + UPLOAD_CHUNK_SIZE, file_size)
+        chunk_end = min(i + trozo, file_size)
         chunk = data[chunk_start:chunk_end]
 
-        chunk_headers = headers.copy()
-        chunk_headers["Content-Length"] = str(len(chunk))
-        chunk_headers["Content-Range"] = (
-            f"bytes {chunk_start}-{chunk_end - 1}/{file_size}"
-        )
+        chunk_headers = {
+            "Content-Length": str(len(chunk)),
+            "Content-Range": f"bytes {chunk_start}-{chunk_end - 1}/{file_size}",
+        }
 
         retry_count = 0
         while retry_count <= 3:
@@ -203,9 +204,6 @@ def _do_chunked_upload(
                         continue
 
                 response.raise_for_status()
-
-                if response.status_code in (200, 201):
-                    return response.json()
                 break
 
             except httpx.HTTPStatusError as e:
@@ -215,10 +213,7 @@ def _do_chunked_upload(
                     continue
                 raise
 
-    raise ValueError(
-        "la sesión de subida ha recibido todos los trozos sin dar el fichero por "
-        "subido: no se ha subido"
-    )
+    return response
 
 
 def create_upload_session(
@@ -252,7 +247,10 @@ def upload_large_file(
     account_id: str | None = None,
     item_properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Upload a large file using upload sessions"""
+    """Sube un fichero al drive: de una vez hasta `UPLOAD_CHUNK_SIZE`, y por
+    encima, con una sesión de subida. La sesión contesta 202 a cada trozo
+    mientras le falta alguno, y 200 o 201, con el fichero, cuando ya lo tiene
+    entero: solo eso lo da por subido."""
     file_size = len(data)
 
     if file_size <= UPLOAD_CHUNK_SIZE:
@@ -262,10 +260,13 @@ def upload_large_file(
         return result
 
     session = create_upload_session(path, account_id, item_properties)
-    upload_url = session["uploadUrl"]
-
-    headers = {"Authorization": f"Bearer {get_token(account_id)}"}
-    return _do_chunked_upload(upload_url, data, headers)
+    response = _do_chunked_upload(session["uploadUrl"], data, UPLOAD_CHUNK_SIZE)
+    if response.status_code not in (200, 201):
+        raise ValueError(
+            "la sesión de subida ha recibido todos los trozos sin dar el fichero "
+            "por subido: no se ha subido"
+        )
+    return response.json()
 
 
 def create_mail_upload_session(
@@ -298,8 +299,13 @@ def upload_large_mail_attachment(
     data: bytes,
     account_id: str | None = None,
     content_type: str = "application/octet-stream",
-) -> dict[str, Any]:
-    """Upload a large mail attachment using upload sessions"""
+) -> None:
+    """Cuelga un adjunto grande de un mensaje con una sesión de subida.
+
+    La sesión es de Outlook, no de Graph, y no contesta como la del drive: 200
+    a cada trozo mientras le falta alguno, y 201, sin cuerpo, cuando ya lo
+    tiene entero y crea el adjunto. Solo ese 201 lo da por adjuntado.
+    """
     file_size = len(data)
 
     attachment_item = {
@@ -310,10 +316,12 @@ def upload_large_mail_attachment(
     }
 
     session = create_mail_upload_session(message_id, attachment_item, account_id)
-    upload_url = session["uploadUrl"]
-
-    headers = {"Authorization": f"Bearer {get_token(account_id)}"}
-    return _do_chunked_upload(upload_url, data, headers)
+    response = _do_chunked_upload(session["uploadUrl"], data, TROZO_DE_ADJUNTO)
+    if response.status_code != 201:
+        raise ValueError(
+            "la sesión de subida ha recibido todos los trozos sin crear el "
+            "adjunto: no se ha adjuntado"
+        )
 
 
 def search_query(
