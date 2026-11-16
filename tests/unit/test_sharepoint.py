@@ -2,6 +2,7 @@
 mismos argumentos (`SharePointMicrosoftMcp.subir`, conectores/sharepoint.py).
 Por aquí suben los informes y las facturas."""
 
+import json
 import pathlib as pl
 from typing import Any
 
@@ -26,6 +27,14 @@ YA_EXISTE = {"error": {"code": "nameAlreadyExists"}}
 # Lo que pide cada paso de la subida a `it/9187497.pdf`
 CARPETA = ("GET", "/v1.0/drives/drive-1/root:/it")
 CREAR_CARPETA = ("POST", "/v1.0/drives/drive-1/root/children")
+# Lo que lleva cada POST que crea la carpeta. `fail` es lo que deja repetirlo:
+# con `rename`, la repetición o la segunda subida crearían «it 1», y con
+# `replace` sustituirían la carpeta que ya está, con sus documentos dentro
+CARPETA_NUEVA = {
+    "name": "it",
+    "folder": {},
+    "@microsoft.graph.conflictBehavior": "fail",
+}
 SUBIR_ENTERO = ("PUT", "/v1.0/drives/drive-1/root:/it/9187497.pdf:/content")
 ABRIR_SESION = (
     "POST",
@@ -52,6 +61,15 @@ def subida(tmp_path: pl.Path, tamano: int) -> dict[str, Any]:
 def rangos(peticiones: list[httpx.Request]) -> list[str]:
     """El Content-Range de cada trozo que llegó a la sesión de subida."""
     return [p.headers["Content-Range"] for p in peticiones if p.url.path == TROZO[1]]
+
+
+def carpetas_creadas(peticiones: list[httpx.Request]) -> list[dict[str, Any]]:
+    """El cuerpo de cada POST que creó la carpeta."""
+    return [
+        json.loads(p.content)
+        for p in peticiones
+        if (p.method, p.url.path) == CREAR_CARPETA
+    ]
 
 
 def test_si_abrir_la_sesion_de_subida_da_un_5xx_se_repite(graph_simulado, tmp_path):
@@ -200,7 +218,8 @@ def test_la_carpeta_que_ya_existe_al_crearla_se_da_por_buena(
     antes la subida fallaba por eso. Por lo mismo, crearla se repite tras un
     5xx: con `fail` nunca quedan dos carpetas, y si ya la creó el primer
     intento, el segundo da 409. Un 409 solo dice que con ese nombre ya hay
-    algo, así que se vuelve a leer, y es la carpeta."""
+    algo, así que se vuelve a leer, y es la carpeta. Todo eso se apoya en que
+    cada POST lleva `fail`, y se mira."""
     graph_simulado.respuestas = [
         httpx.Response(404),
         *[respuesta for _, respuesta in al_crearla],
@@ -213,6 +232,9 @@ def test_la_carpeta_que_ya_existe_al_crearla_se_da_por_buena(
         *[peticion for peticion, _ in al_crearla],
         SUBIR_ENTERO,
     ]
+    assert carpetas_creadas(graph_simulado.peticiones) == [CARPETA_NUEVA] * sum(
+        peticion == CREAR_CARPETA for peticion, _ in al_crearla
+    )
     assert graph_simulado.esperas == esperas
 
 
@@ -249,6 +271,10 @@ def test_si_con_el_nombre_de_la_carpeta_hay_un_fichero_no_se_sube(
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         peticion for peticion, _ in hasta_el_fichero
     ]
+    # con `replace`, el POST se habría llevado por delante el fichero
+    assert carpetas_creadas(graph_simulado.peticiones) == [CARPETA_NUEVA] * sum(
+        peticion == CREAR_CARPETA for peticion, _ in hasta_el_fichero
+    )
 
 
 @pytest.mark.parametrize(
@@ -278,4 +304,7 @@ def test_si_la_carpeta_no_se_puede_crear_no_se_sube(
         CARPETA,
         *[CREAR_CARPETA] * len(al_crearla),
     ]
+    assert carpetas_creadas(graph_simulado.peticiones) == [CARPETA_NUEVA] * len(
+        al_crearla
+    )
     assert graph_simulado.esperas == esperas
