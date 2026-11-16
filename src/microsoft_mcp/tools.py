@@ -212,8 +212,9 @@ def get_email(
 
 def _retirar_borrador_a_medias(
     message_id: str, account_id: str, error: Exception
-) -> None:
-    """Retira el borrador que `error` ha dejado a medias, antes de que el error suba.
+) -> RuntimeError:
+    """Retira el borrador que `error` ha dejado a medias, y devuelve el error con
+    que falla la llamada: el de `error`, y qué ha sido del borrador.
 
     Si falla la subida de un adjunto, el borrador queda creado, dirigido a
     quien iba y sin él: la sesión de subida se repite tras un 5xx (graph.py),
@@ -222,10 +223,12 @@ def _retirar_borrador_a_medias(
     podría retirarlo, y si repite crea otro.
 
     Retirar es moverlo a Elementos eliminados, de donde se recupera, como en
-    radon-api: un DELETE lo borraba sin pasar por ahí. Mover le cambia el id,
-    así que se puede repetir tras un 5xx: si el primer intento ya lo había
-    movido, el siguiente da 404, y es que ya no está en Borradores. Si aun así
-    falla, el error lleva el id para retirarlo a mano.
+    radon-api: un DELETE lo borraba sin pasar por ahí. Como allí queda, con su
+    destinatario y su asunto, el error lo dice. Mover le cambia el id, así que
+    se puede repetir tras un 5xx: si el primer intento ya lo había movido, el
+    siguiente da 404 con ErrorItemNotFound, y es que ya no está en Borradores.
+    Cualquier otro fallo, también un 404 con otro código, no dice que se haya
+    ido: el error lleva el id, para retirarlo a mano si sigue ahí.
     """
     try:
         graph.request(
@@ -236,17 +239,33 @@ def _retirar_borrador_a_medias(
             repetible=True,
         )
     except Exception as fallo:
-        if (
-            isinstance(fallo, httpx.HTTPStatusError)
-            and fallo.response.status_code == 404
-        ):
-            # ya no está con ese id: lo movió un intento que Graph contestó con
-            # un 5xx
-            return
-        raise RuntimeError(
+        if _ya_no_esta(fallo):
+            return RuntimeError(
+                f"{error}. El borrador a medias ya no está en Borradores"
+            )
+        return RuntimeError(
             f"{error}. Además, el borrador a medias {message_id} no se ha podido "
             f"retirar ({fallo}): si sigue en Borradores, hay que retirarlo a mano"
-        ) from fallo
+        )
+    return RuntimeError(
+        f"{error}. El borrador a medias se ha movido a Elementos eliminados"
+    )
+
+
+def _ya_no_esta(fallo: Exception) -> bool:
+    """Si Graph dice que el mensaje ya no está: un 404 con ErrorItemNotFound, que
+    es lo que contesta por uno que se ha movido, porque mover le cambia el id.
+    Como `_ya_no_esta` de radon-api (conectores/graph_correo.py)."""
+    if not (
+        isinstance(fallo, httpx.HTTPStatusError) and fallo.response.status_code == 404
+    ):
+        return False
+    try:
+        codigo = fallo.response.json()["error"]["code"]
+    except (ValueError, LookupError, TypeError):
+        # sin cuerpo, o sin el error de Graph: no dice que se haya ido
+        return False
+    return codigo == "ErrorItemNotFound"
 
 
 @mcp.tool
@@ -323,8 +342,7 @@ def create_email_draft(
                 att.get("content_type", "application/octet-stream"),
             )
     except Exception as error:
-        _retirar_borrador_a_medias(message_id, account_id, error)
-        raise
+        raise _retirar_borrador_a_medias(message_id, account_id, error) from error
 
     return result
 
@@ -441,8 +459,7 @@ def send_email(
                         json=small_att,
                     )
         except Exception as error:
-            _retirar_borrador_a_medias(message_id, account_id, error)
-            raise
+            raise _retirar_borrador_a_medias(message_id, account_id, error) from error
 
         # Fuera del try: si el /send falla, Graph pudo mandarlo antes de
         # contestar. No se sabe si salió, y el borrador ya está completo, así

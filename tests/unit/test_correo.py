@@ -168,6 +168,13 @@ def sesion_que_no_se_abre() -> list[httpx.Response]:
     return [httpx.Response(502) for _ in range(4)]
 
 
+def destinos(peticiones: list[httpx.Request]) -> list[dict[str, Any]]:
+    """El cuerpo de cada move del borrador: adónde se pidió llevarlo."""
+    return [
+        json.loads(p.content) for p in peticiones if (p.method, p.url.path) == MOVER_M1
+    ]
+
+
 @CON_UN_ADJUNTO_GRANDE
 def test_si_falla_la_subida_de_un_adjunto_grande_el_borrador_se_retira(
     graph_simulado, tmp_path, herramienta, argumentos
@@ -175,8 +182,9 @@ def test_si_falla_la_subida_de_un_adjunto_grande_el_borrador_se_retira(
     """Si la sesión de subida del adjunto no se abre, el borrador ya estaba
     creado, dirigido a quien iba y sin el adjunto, y quien llama no sabe su id:
     no podría retirarlo y, si repite, crearía otro. Se retira a Elementos
-    eliminados, de donde se recupera, y el 502 llega a radon-api tal cual. Antes
-    se borraba con un DELETE, sin pasar por ahí."""
+    eliminados, de donde se recupera, y el 502 llega a radon-api diciendo que
+    el borrador está allí, con su destinatario y su asunto. Antes se borraba
+    con un DELETE, sin pasar por ahí."""
     graph_simulado.respuestas = [
         httpx.Response(201, json={"id": "m1"}),
         *sesion_que_no_se_abre(),
@@ -187,12 +195,13 @@ def test_si_falla_la_subida_de_un_adjunto_grande_el_borrador_se_retira(
 
     assert error is not None
     assert "502 Bad Gateway" in error
+    assert "El borrador a medias se ha movido a Elementos eliminados" in error
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "/v1.0/me/messages"),
         *[ABRIR_SESION_M1] * 4,
         MOVER_M1,
     ]
-    assert json.loads(graph_simulado.peticiones[-1].content) == A_ELIMINADOS
+    assert destinos(graph_simulado.peticiones) == [A_ELIMINADOS]
     assert graph_simulado.esperas == [1, 2, 4]
 
 
@@ -202,8 +211,8 @@ def test_si_el_borrador_ya_se_movio_el_404_es_que_esta_retirado(
 ):
     """Mover se repite tras un 5xx: le cambia el id al mensaje, así que
     repetirlo no lo mueve dos veces ni toca otro. Si Graph lo movió antes de
-    contestar el 503, el siguiente intento da 404, y es que ya no está en
-    Borradores: el error es solo el 502 de la subida."""
+    contestar el 503, el siguiente intento da 404 con ErrorItemNotFound, y es
+    que ya no está en Borradores: el error es el 502 de la subida, y lo dice."""
     graph_simulado.respuestas = [
         httpx.Response(201, json={"id": "m1"}),
         *sesion_que_no_se_abre(),
@@ -215,6 +224,7 @@ def test_si_el_borrador_ya_se_movio_el_404_es_que_esta_retirado(
 
     assert error is not None
     assert "502 Bad Gateway" in error
+    assert "El borrador a medias ya no está en Borradores" in error
     assert "no se ha podido retirar" not in error
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "/v1.0/me/messages"),
@@ -222,7 +232,48 @@ def test_si_el_borrador_ya_se_movio_el_404_es_que_esta_retirado(
         MOVER_M1,
         MOVER_M1,
     ]
+    assert destinos(graph_simulado.peticiones) == [A_ELIMINADOS] * 2
     assert graph_simulado.esperas == [1, 2, 4, 1]
+
+
+@pytest.mark.parametrize(
+    "no_encontrado",
+    [
+        pytest.param(
+            httpx.Response(404, json={"error": {"code": "ResourceNotFound"}}),
+            id="otro-codigo",
+        ),
+        pytest.param(httpx.Response(404), id="sin-cuerpo"),
+    ],
+)
+@CON_UN_ADJUNTO_GRANDE
+def test_un_404_que_no_dice_que_el_borrador_se_haya_ido_no_lo_da_por_retirado(
+    graph_simulado, tmp_path, herramienta, argumentos, no_encontrado
+):
+    """Solo el 404 con ErrorItemNotFound dice que el mensaje ya no está, como en
+    radon-api (`_ya_no_esta`, conectores/graph_correo.py). Otro 404 no dice que
+    se haya movido: el borrador puede seguir en Borradores, dirigido al
+    cliente, y el error da su id, para retirarlo a mano, en vez de callarlo."""
+    graph_simulado.respuestas = [
+        httpx.Response(201, json={"id": "m1"}),
+        *sesion_que_no_se_abre(),
+        no_encontrado,
+    ]
+
+    error = llamar_por_mcp(herramienta, argumentos(pdf(tmp_path, TRES_MIB + 1)))
+
+    assert error is not None
+    assert "502 Bad Gateway" in error
+    assert (
+        "el borrador a medias m1 no se ha podido retirar (Client error '404 Not "
+        "Found'" in error
+    )
+    assert "si sigue en Borradores, hay que retirarlo a mano" in error
+    assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
+        ("POST", "/v1.0/me/messages"),
+        *[ABRIR_SESION_M1] * 4,
+        MOVER_M1,
+    ]
 
 
 @CON_UN_ADJUNTO_GRANDE
@@ -252,6 +303,7 @@ def test_si_tampoco_se_puede_retirar_el_borrador_el_error_dice_cual_es(
         *[ABRIR_SESION_M1] * 4,
         *[MOVER_M1] * 4,
     ]
+    assert destinos(graph_simulado.peticiones) == [A_ELIMINADOS] * 4
     assert graph_simulado.esperas == [1, 2, 4, 1, 2, 4]
 
 
@@ -340,7 +392,9 @@ def test_la_impresora_manda_un_pdf_que_va_en_varios_trozos(graph_simulado, tmp_p
         TROZO_M1,
         ("POST", "/v1.0/me/messages/m1/send"),
     ]
-    trozos = [p for p in graph_simulado.peticiones if (p.method, p.url.path) == TROZO_M1]
+    trozos = [
+        p for p in graph_simulado.peticiones if (p.method, p.url.path) == TROZO_M1
+    ]
     assert [(p.headers["Content-Range"], len(p.content)) for p in trozos] == [
         (f"bytes 0-{trozo - 1}/{total}", trozo),
         (f"bytes {trozo}-{trozo}/{total}", 1),
@@ -367,10 +421,11 @@ def test_si_la_sesion_no_crea_el_adjunto_el_borrador_se_retira(
 
     assert error is not None
     assert "sin crear el adjunto: no se ha adjuntado" in error
+    assert "El borrador a medias se ha movido a Elementos eliminados" in error
     assert [(p.method, p.url.path) for p in graph_simulado.peticiones] == [
         ("POST", "/v1.0/me/messages"),
         ABRIR_SESION_M1,
         TROZO_M1,
         MOVER_M1,
     ]
-    assert json.loads(graph_simulado.peticiones[-1].content) == A_ELIMINADOS
+    assert destinos(graph_simulado.peticiones) == [A_ELIMINADOS]
